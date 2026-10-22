@@ -1,0 +1,1 @@
+"""Local SetFit intent classification."""

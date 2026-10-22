@@ -1,0 +1,1 @@
+"""SoraLink application configuration."""

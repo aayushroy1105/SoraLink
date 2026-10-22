@@ -1,0 +1,5 @@
+Flask
+Flask-SocketIO
+simple-websocket==1.0.0
+itsdangerous
+pytest

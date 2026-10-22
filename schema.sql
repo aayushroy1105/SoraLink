@@ -1,0 +1,1 @@
+-- SoraLink database schema; implementation pending.

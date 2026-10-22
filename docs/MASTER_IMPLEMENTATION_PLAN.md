@@ -1,7 +1,10 @@
-# SoraLink — Master Implementation Plan v1.0
+# SoraLink — Master Implementation Plan v1.1
 
 Prepared: 22 October 2026
+Last revised: 23 October 2026
 Purpose: Complete project specification, team workflow, implementation sequence, and testing contract.
+
+Revision 1.1 aligns the master plan with the canonical intent catalog, standardizes the voice-preview route names, and reconciles the team branch names. It does not claim that any code or tests have already been completed.
 
 This is the master specification for building SoraLink. It is intended to be the shared reference for all four teammates and their separate AI chats.
 
@@ -121,7 +124,7 @@ This is the first end-to-end feature the team must complete. It must work before
 1. The passenger taps Speak.
 2. The browser asks for microphone permission if required.
 3. The passenger records a short utterance.
-4. The browser uploads the recording to `POST /api/voice/preview`.
+4. The browser uploads the recording to `POST /api/voice_request`.
 5. The server validates the authenticated session, recording size, MIME type, and inference queue capacity.
 6. A locally loaded Whisper model transcribes the recording.
 7. A locally loaded SetFit classifier suggests one of the approved intent IDs.
@@ -528,10 +531,10 @@ Recommended feature branches:
 
 ```text
 main
-├── feature/ai-audio
-├── feature/backend
-├── feature/frontend
-└── feature/integration-qa
+├── work/ai-audio
+├── work/backend
+├── work/frontend
+└── work/integration-qa
 ```
 
 Suggested commit names:
@@ -592,33 +595,39 @@ A change after freeze requires a documented decision in `docs/DECISIONS.md` and 
 
 This is the most important agreement between the four developers. A writes the voice pipeline, B writes the backend, C writes the frontend, and D integrates them. All four must agree on the same vocabulary and formats.
 
-## 7.1 Intent catalog: 15 bounded intents
+## 7.1 Canonical intent catalog: 15 bounded intents
 
-The project requires 15 bounded intents: four urgent and eleven routine. The following IDs are the proposed canonical v1 set for the implementation. If your previously submitted solution deck or an existing project file has a different approved catalog, reconcile it before coding, then freeze one catalog. Do not let each teammate invent their own IDs.
+The approved SoraLink v1 intent catalog contains exactly 15 intent IDs: four urgent and eleven routine. The canonical source is `docs/INTENT_CATALOG.md`, and the machine-readable catalog is `data/intents.json`.
 
-URGENT:
-- `medical_emergency` — Medical help is needed.
-- `breathing_difficulty` — Trouble breathing.
-- `injury_or_bleeding` — Injury, bleeding, or significant pain.
-- `safety_security_concern` — Immediate safety or security concern.
+### URGENT — 4 intents
+- `medical_help` — Passenger requests medical assistance.
+- `accessibility_assist` — Passenger needs accessibility-related assistance.
+- `safety_concern` — Passenger reports a safety or security concern.
+- `motion_sickness` — Passenger reports motion sickness or requests related assistance.
 
-ROUTINE:
+### ROUTINE — 11 intents
 - `water_request` — Request water or another approved drink.
-- `meal_request` — Meal or food request.
 - `blanket_request` — Request a blanket.
 - `pillow_request` — Request a pillow.
-- `restroom_assistance` — Help related to restroom use.
-- `seat_assistance` — Help with seat, tray, or seat controls.
-- `baggage_assistance` — Help with cabin baggage.
-- `temperature_comfort` — Too hot, too cold, or comfort adjustment.
-- `entertainment_help` — Help with the entertainment system.
-- `language_assistance` — Help communicating across a language barrier.
-- `other_request` — Request not represented by another approved intent.
+- `bag_help` — Request assistance with cabin baggage.
+- `headphone_request` — Request headphones or related assistance.
+- `meal_inquiry` — Ask about meals or food options.
+- `tea_coffee` — Request or inquire about tea or coffee.
+- `lavatory_assist` — Request lavatory-related assistance.
+- `seat_issue` — Report a seat, tray, or seat-control issue.
+- `customs_form` — Request assistance with a customs form.
+- `baby_care` — Request assistance related to baby care.
 
-The IDs are permanent for this version once the contract is frozen. Display labels, translations, and phrases can be updated without changing the IDs.
+### Catalog rules
 
-These are routing labels for a prototype, not a medical diagnosis. Any possible urgent input should remain available for crew review. Do not let the classifier silently drop a potentially urgent request because it scores below a threshold.
+1. These IDs must match exactly across `docs/INTENT_CATALOG.md`, `data/intents.json`, the SetFit classifier, backend validation, frontend request cards, API examples, and automated tests.
+2. The server derives priority from the approved catalog. The browser and classifier cannot independently assign authoritative priority.
+3. Classification scores are not guaranteed probabilities unless calibrated and evaluated accordingly.
+4. The initial confidence threshold, if configured, must be evaluated against a separate holdout dataset. Low-confidence results must offer alternatives and a visual or typed fallback.
+5. Potentially urgent requests must remain available for crew review even when classification is uncertain. The classifier must never silently discard them.
+6. Any catalog change requires a documented decision and coordinated updates to all affected contracts and tests.
 
+The catalog is frozen for v1 once the team verifies that all shared files use these exact IDs.
 ## 7.2 What goes in `data/intents.json`
 
 Each intent should include:
@@ -961,8 +970,8 @@ Use stable machine-readable `error.code` values. Frontend logic should not parse
 - `POST /api/auth/crew` — crew login.
 - `GET /api/auth/me` — return authenticated user's safe profile.
 - `POST /api/auth/logout` — revoke current session.
-- `POST /api/voice/preview` — transcribe audio and suggest intents.
-- `GET /api/voice/previews/<preview_id>` — recover a valid current user's preview.
+- `POST /api/voice_request` — transcribe audio and suggest intents in one local pipeline, then return a review preview; this endpoint does not create the final request.
+- `GET /api/voice/previews/<preview_id>` — recover an unexpired, unconsumed preview owned by the current user.
 - `POST /api/classify` — optional typed-text classification.
 - `POST /api/requests` — create a final confirmed request.
 - `GET /api/my-requests` — list current passenger's requests.
@@ -1022,7 +1031,7 @@ After successful login, the backend creates a session and sends the cookie. The 
 
 ## 9.4 Voice-preview contract
 
-`POST /api/voice/preview` receives multipart form data, not a JSON-only body.
+`POST /api/voice_request` receives multipart form data, not a JSON-only body. It runs local transcription and intent classification in a single endpoint call and returns a preview for passenger review. It must not create the final request. The final request is created only after the passenger confirms, through `POST /api/requests`.
 
 Required field:
 ```text
@@ -1072,7 +1081,7 @@ Example uncertain result:
         "score": 0.54
       },
       {
-        "intent_id": "meal_request",
+        "intent_id": "meal_inquiry",
         "score": 0.51
       }
     ],
@@ -1490,11 +1499,15 @@ The classifier must produce three behavioral outcomes.
 
 Outcome A — Clear suggestion: Return the top suggested intent and allow the passenger to confirm it. A clear suggestion is still not a final request.
 
-Outcome B — Requires choice: Return the leading candidates and tell the frontend that the passenger must choose. Include a “None of these” option.
+Outcome B — Requires choice: Return the leading candidates and tell the frontend that the passenger must choose. Include a “None of these” option. Selecting “None of these” opens the visual category cards or the direct crew-assistance path; it must never be a dead end.
 
-Outcome C — Unreliable: Show that the voice request could not be classified reliably, retain the transcript when available, and allow typed input or visual cards.
+Outcome C — Unreliable: Show that the voice request could not be classified reliably, retain the transcript when available, and allow typed input or visual cards. A possible urgent need must remain available for crew review even if classification is unreliable.
 
-Tune classification thresholds and candidate-margin rules using a validation set. Do not make up a confidence threshold because it looks plausible.
+Initial threshold: use a configurable `CONFIDENCE_THRESHOLD=0.72` as a starting value only. It is not a validated threshold and must not be represented as an empirically established accuracy boundary. Evaluate it using a separate, untouched holdout set of spoken paraphrases, accents/code-switching examples, and noisy transcription outputs. Record the threshold, score type, evaluation method, and actual results.
+
+During v1, use the classifier's documented semantic score as the primary ranking signal. Fuzzy or phonetic matching may support ambiguous results as a tie-breaker, but must be normalized and tested. Do not combine differently scaled scores into a weighted score unless both are on the same defined scale and the combined method has been evaluated.
+
+Tune classification thresholds and candidate-margin rules using the holdout set. Do not claim accuracy, calibration, or accent robustness without measured results.
 
 ## 12.8 Urgency handling
 
@@ -2226,7 +2239,7 @@ Once this master message has been branched into four chats, each teammate should
 
 You are the AI and Audio implementation owner for SoraLink.
 
-Follow the SoraLink Master Implementation Plan v1.0 and the repository's current `docs/API_CONTRACT.md`, `docs/INTENT_CATALOG.md`, and `docs/DECISIONS.md`.
+Follow the SoraLink Master Implementation Plan v1.1 and the repository's current `docs/API_CONTRACT.md`, `docs/INTENT_CATALOG.md`, and `docs/DECISIONS.md`.
 
 Your primary files are `voice.py`, `classifier.py`, and the AI evaluation and model-preparation scripts under `scripts/`. Coordinate tests with the integration owner.
 
@@ -2248,7 +2261,7 @@ Follow the shared master specification even when a different implementation seem
 
 You are the Backend implementation owner for SoraLink.
 
-Follow the SoraLink Master Implementation Plan v1.0 and the frozen API, database, and Socket.IO contracts in the repository.
+Follow the SoraLink Master Implementation Plan v1.1 and the frozen API, database, and Socket.IO contracts in the repository.
 
 Your primary files are `app.py`, `config.py`, `database.py`, `auth.py`, `requests_service.py`, `broadcast_service.py`, `schema.sql`, and `seed_db.py`.
 
@@ -2270,7 +2283,7 @@ The first milestone is a complete no-AI visual request flow from passenger to cr
 
 You are the Frontend implementation owner for SoraLink.
 
-Follow the SoraLink Master Implementation Plan v1.0 and the repository's frozen API, data, and Socket.IO contracts.
+Follow the SoraLink Master Implementation Plan v1.1 and the repository's frozen API, data, and Socket.IO contracts.
 
 Your primary files are the templates under `templates/`, styles under `static/css/`, and client scripts under `static/js/`.
 
@@ -2292,7 +2305,7 @@ Prioritize a functioning, accessible visual request loop before visual polish or
 
 You are the Integration, QA, and Offline Reliability owner for SoraLink.
 
-Follow the SoraLink Master Implementation Plan v1.0 and current repository contracts. Your primary responsibilities are `tests/`, `docs/TEST_PLAN.md`, `docs/NETWORK_SETUP.md`, `README.md`, and coordinated integration fixes.
+Follow the SoraLink Master Implementation Plan v1.1 and current repository contracts. Your primary responsibilities are `tests/`, `docs/TEST_PLAN.md`, `docs/NETWORK_SETUP.md`, `README.md`, and coordinated integration fixes.
 
 Start by inspecting the actual repository, current application startup path, dependencies, contracts, and existing tests. Do not assume a test passed just because a test file exists.
 

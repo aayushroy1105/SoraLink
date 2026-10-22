@@ -5,21 +5,20 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BASE_DIR / "data" / "soralink.db"
+DEFAULT_DB_PATH = BASE_DIR / "instance" / "soralink.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 
 
 def get_db_path() -> Path:
     """Return the configured database path."""
-    configured_path = os.environ.get("SOTALINK_DB_PATH") or os.environ.get(
-        "SORALINK_DB_PATH"
-    )
+    configured_path = os.environ.get("SORALINK_DB_PATH")
     return Path(configured_path).expanduser() if configured_path else DEFAULT_DB_PATH
 
 
@@ -41,12 +40,7 @@ def get_connection() -> sqlite3.Connection:
 
 @contextmanager
 def get_db() -> Iterator[sqlite3.Connection]:
-    """Yield a connection and always close it.
-
-    Use the connection as a context-managed unit of work. Transactions
-    must be started explicitly with `BEGIN` when multiple statements
-    need to commit or roll back together.
-    """
+    """Yield a connection and always close it."""
     connection = get_connection()
     try:
         yield connection
@@ -66,7 +60,6 @@ def init_db() -> None:
     try:
         # journal_mode cannot be changed inside a transaction.
         connection.execute("PRAGMA journal_mode = WAL")
-
         schema = SCHEMA_PATH.read_text(encoding="utf-8")
         connection.executescript(schema)
     finally:
@@ -90,6 +83,4 @@ def transaction(
 
 def now_ms() -> int:
     """Return the current UTC Unix timestamp in milliseconds."""
-    import time
-
     return time.time_ns() // 1_000_000

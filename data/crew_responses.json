@@ -1,1 +1,56 @@
 
+{
+  "version": "1.0",
+  "responses": {
+    "request_received": {
+      "label": "Request received",
+      "messages": {
+        "en": "Your request has been received. Please wait for a crew member.",
+        "ja": "リクエストを受け付けました。乗務員がお伺いするまでお待ちください。"
+      }
+    },
+    "request_acknowledged": {
+      "label": "Crew acknowledged",
+      "messages": {
+        "en": "A crew member has acknowledged your request.",
+        "ja": "乗務員がリクエストを確認しました。"
+      }
+    },
+    "request_completed": {
+      "label": "Request completed",
+      "messages": {
+        "en": "Your request has been marked as completed. Please let the crew know if you need further assistance.",
+        "ja": "リクエストは完了しました。引き続きサポートが必要な場合は、乗務員にお知らせください。"
+      }
+    },
+    "request_unavailable": {
+      "label": "Request unavailable",
+      "messages": {
+        "en": "We couldn't process that request. Please select a request category or ask a crew member for assistance.",
+        "ja": "リクエストを処理できませんでした。カテゴリーを選択するか、乗務員にお知らせください。"
+      }
+    },
+    "voice_not_understood": {
+      "label": "Voice not understood",
+      "messages": {
+        "en": "Sorry, we couldn't understand the audio. Please try again or select a request category.",
+        "ja": "音声を認識できませんでした。もう一度お試しいただくか、カテゴリーを選択してください。"
+      }
+    },
+    "crew_on_the_way": {
+      "label": "Crew notified",
+      "messages": {
+        "en": "The crew has been notified. Please wait at your seat unless instructed otherwise.",
+        "ja": "乗務員に通知しました。別途案内がある場合を除き、お席でお待ちください。"
+      }
+    },
+    "offline_mode": {
+      "label": "Offline mode",
+      "messages": {
+        "en": "SoraLink is operating on the local cabin network. Your request can still be submitted while internet access is unavailable.",
+        "ja": "SoraLinkは機内のローカルネットワークで動作しています。インターネットに接続できない場合でもリクエストを送信できます。"
+      }
+    }
+  }
+}
+

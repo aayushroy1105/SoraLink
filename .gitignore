@@ -218,3 +218,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+instance/*.db
+instance/*.db-shm
+instance/*.db-wal
+
+models/*
+!models/README.md
+
+certs/
+*.log
+*.webm
+*.wav
+*.m4a
+.DS_Store

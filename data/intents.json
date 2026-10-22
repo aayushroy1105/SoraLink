@@ -1,1 +1,98 @@
 
+{
+  "version": "1.0",
+  "confidence_threshold": 0.72,
+  "intents": [
+    {
+      "id": "medical_help",
+      "label": "Medical help",
+      "description": "Passenger needs medical assistance.",
+      "priority": "urgent"
+    },
+    {
+      "id": "accessibility_assist",
+      "label": "Accessibility assistance",
+      "description": "Passenger needs assistance related to mobility or accessibility.",
+      "priority": "urgent"
+    },
+    {
+      "id": "safety_concern",
+      "label": "Safety concern",
+      "description": "Passenger reports a safety concern.",
+      "priority": "urgent"
+    },
+    {
+      "id": "motion_sickness",
+      "label": "Motion sickness",
+      "description": "Passenger feels airsick or needs assistance with motion sickness.",
+      "priority": "urgent"
+    },
+    {
+      "id": "water_request",
+      "label": "Water",
+      "description": "Passenger requests drinking water.",
+      "priority": "routine"
+    },
+    {
+      "id": "blanket_request",
+      "label": "Blanket",
+      "description": "Passenger requests a blanket.",
+      "priority": "routine"
+    },
+    {
+      "id": "pillow_request",
+      "label": "Pillow",
+      "description": "Passenger requests a pillow.",
+      "priority": "routine"
+    },
+    {
+      "id": "bag_help",
+      "label": "Baggage assistance",
+      "description": "Passenger needs help with their baggage.",
+      "priority": "routine"
+    },
+    {
+      "id": "headphone_request",
+      "label": "Headphones",
+      "description": "Passenger requests headphones.",
+      "priority": "routine"
+    },
+    {
+      "id": "meal_inquiry",
+      "label": "Meal inquiry",
+      "description": "Passenger asks about meal availability or options.",
+      "priority": "routine"
+    },
+    {
+      "id": "tea_coffee",
+      "label": "Tea or coffee",
+      "description": "Passenger requests tea or coffee.",
+      "priority": "routine"
+    },
+    {
+      "id": "lavatory_assist",
+      "label": "Lavatory assistance",
+      "description": "Passenger needs assistance accessing or using the lavatory.",
+      "priority": "routine"
+    },
+    {
+      "id": "seat_issue",
+      "label": "Seat issue",
+      "description": "Passenger reports a seat-related problem.",
+      "priority": "routine"
+    },
+    {
+      "id": "customs_form",
+      "label": "Customs form",
+      "description": "Passenger needs help with a customs or arrival form.",
+      "priority": "routine"
+    },
+    {
+      "id": "baby_care",
+      "label": "Baby care",
+      "description": "Passenger requests assistance related to an infant or baby.",
+      "priority": "routine"
+    }
+  ]
+}
+

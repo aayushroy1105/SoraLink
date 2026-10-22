@@ -1,0 +1,1 @@
+"""Persistent PA announcement lifecycle."""

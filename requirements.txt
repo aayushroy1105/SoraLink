@@ -1,5 +1,9 @@
+
 Flask
 Flask-SocketIO
 simple-websocket==1.0.0
 itsdangerous
 pytest
+
+# Optional local AI dependencies — install when setting up voice/AI:
+# python -m pip install faster-whisper setfit

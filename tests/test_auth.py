@@ -442,3 +442,22 @@ def test_socketio_session_cookie_authentication(app: Any, client: FlaskClient):
     client.post("/api/auth/logout")
     post_logout_socket = socketio.test_client(app, flask_test_client=client)
     assert not post_logout_socket.is_connected()
+
+
+def test_html_page_routes(client: FlaskClient):
+    """HTML frontend routes serve their corresponding templates."""
+    res_root = client.get("/")
+    assert res_root.status_code == 200
+    assert b"<!doctype html>" in res_root.data.lower()
+
+    res_login = client.get("/login")
+    assert res_login.status_code == 200
+    assert b"<!doctype html>" in res_login.data.lower()
+
+    res_pass = client.get("/passenger")
+    assert res_pass.status_code == 200
+    assert b"<!doctype html>" in res_pass.data.lower()
+
+    res_crew = client.get("/crew")
+    assert res_crew.status_code == 200
+    assert b"<!doctype html>" in res_crew.data.lower()

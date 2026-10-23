@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from functools import wraps
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit, join_room
 
 import auth as auth_service
@@ -47,6 +47,19 @@ def create_app(config_name=None):
     @app.get("/api/health")
     def health():
         return success({"service": "SoraLink", "status": "ok"})
+
+    @app.get("/")
+    @app.get("/login")
+    def page_login():
+        return render_template("login.html")
+
+    @app.get("/passenger")
+    def page_passenger():
+        return render_template("passenger.html")
+
+    @app.get("/crew")
+    def page_crew():
+        return render_template("crew.html")
 
     def _apply_session_cookie(response, token):
         cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")

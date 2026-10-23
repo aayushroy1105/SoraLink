@@ -28,6 +28,8 @@ DEMO_INVITES = {
     "12C": "DEMO-12C",
     "14A": "DEMO-14A",
     "14B": "DEMO-14B",
+    "18A": "0000",
+    "32D": "DEMO-32D",
 }
 
 def hash_invite_code(code: str) -> str:

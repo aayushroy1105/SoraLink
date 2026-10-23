@@ -45,10 +45,45 @@ def create_app(config_name=None):
     def health():
         return success({"service": "SoraLink", "status": "ok"})
 
-    def current_session():
-        return auth_service.get_current_session(
-            request.headers.get("Authorization")
+    def _apply_session_cookie(response, token):
+        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+        ttl = app.config.get("SESSION_TTL_SECONDS", 8 * 3600)
+        secure = app.config.get("SESSION_COOKIE_SECURE", False) or request.is_secure
+        response.set_cookie(
+            key=cookie_name,
+            value=token,
+            max_age=ttl,
+            httponly=True,
+            samesite="Lax",
+            secure=secure,
+            path="/",
         )
+        return response
+
+    def _clear_session_cookie(response):
+        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+        secure = app.config.get("SESSION_COOKIE_SECURE", False) or request.is_secure
+        response.delete_cookie(
+            key=cookie_name,
+            path="/",
+            httponly=True,
+            samesite="Lax",
+            secure=secure,
+        )
+        return response
+
+    def current_session():
+        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+        token = request.cookies.get(cookie_name)
+        if not token:
+            token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+        if not token:
+            raise auth_service.AuthenticationError("Missing session cookie")
+
+        session = auth_service.get_session_by_token(token)
+        if session is None:
+            raise auth_service.AuthenticationError("Missing, invalid, expired, or revoked session")
+        return session
 
     def authenticated(role=None):
         """Protect a route using the server-resolved session."""
@@ -69,36 +104,87 @@ def create_app(config_name=None):
 
     @app.post("/api/auth/passenger")
     def passenger_login():
-        body = request.get_json(silent=True) or {}
+        if not request.is_json:
+            return failure("Request body must be JSON", 400, "BAD_REQUEST")
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return failure("Request body must be a JSON object", 400, "BAD_REQUEST")
+
+        seat_label = body.get("seat_label")
+        demo_code = body.get("demo_code") or body.get("invite_code")
+
+        if not seat_label or not demo_code or not isinstance(seat_label, str) or not isinstance(demo_code, str):
+            return failure("seat_label and demo_code are required strings", 400, "BAD_REQUEST")
+
         try:
-            result = auth_service.authenticate_passenger(
-                body.get("invite_code", "")
-            )
-            return success(result, 200)
+            result = auth_service.authenticate_passenger(seat_label, demo_code)
+            resp, status = success({
+                "role": "passenger",
+                "seat_label": result["session"]["seat_label"],
+                "session_id": result["session"]["id"],
+            }, 200)
+            return _apply_session_cookie(resp, result["token"]), status
         except auth_service.AuthenticationError as exc:
             return failure(str(exc), 401, "INVALID_CREDENTIALS")
 
     @app.post("/api/auth/crew")
     def crew_login():
-        body = request.get_json(silent=True) or {}
+        if not request.is_json:
+            return failure("Request body must be JSON", 400, "BAD_REQUEST")
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return failure("Request body must be a JSON object", 400, "BAD_REQUEST")
+
+        username = body.get("username")
+        password = body.get("password") or body.get("crew_code") or body.get("crew_pin")
+
+        if not password or (username is None and not body.get("crew_code") and not body.get("crew_pin")):
+            return failure("username and password are required", 400, "BAD_REQUEST")
+
+        if not username:
+            username = "crew_demo"
+
+        if not isinstance(username, str) or not isinstance(password, str):
+            return failure("username and password must be strings", 400, "BAD_REQUEST")
+
         try:
-            result = auth_service.authenticate_crew(
-                body.get("crew_code", "")
-            )
-            return success(result, 200)
+            result = auth_service.authenticate_crew(username, password)
+            resp, status = success({
+                "role": "crew",
+                "crew_id": result["session"]["id"],
+                "session_id": result["session"]["id"],
+            }, 200)
+            return _apply_session_cookie(resp, result["token"]), status
         except auth_service.AuthenticationError as exc:
             return failure(str(exc), 401, "INVALID_CREDENTIALS")
 
     @app.get("/api/auth/me")
     @authenticated()
     def who_am_i(session):
-        return success({"session": session})
+        data = {
+            "role": session["role"],
+            "session_id": session["id"],
+            "session": {
+                "id": session["id"],
+                "role": session["role"],
+                "seat_label": session.get("seat_label"),
+                "created_at_ms": session.get("created_at_ms"),
+                "expires_at_ms": session.get("expires_at_ms"),
+            },
+        }
+        if session["role"] == "passenger":
+            data["seat_label"] = session.get("seat_label")
+        elif session["role"] == "crew":
+            data["crew_id"] = session["id"]
+
+        return success(data)
 
     @app.post("/api/auth/logout")
     @authenticated()
     def logout(session):
         auth_service.revoke_session(session["id"])
-        return success({"logged_out": True})
+        resp, status = success({"logged_out": True}, 200)
+        return _clear_session_cookie(resp), status
 
     @app.get("/api/passenger/state")
     @authenticated("passenger")
@@ -266,17 +352,15 @@ def create_app(config_name=None):
 
     @socketio.on("connect")
     def socket_connect(auth_data=None):
-        # Socket.IO auth is resolved from the bearer token, never a client role.
-        token = None
-        if isinstance(auth_data, dict):
+        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+        token = request.cookies.get(cookie_name)
+        if not token:
+            token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+
+        if not token and isinstance(auth_data, dict):
             token = auth_data.get("token")
 
-        if not token:
-            token = auth_service.get_bearer_token(
-                request.headers.get("Authorization")
-            )
-
-        session = auth_service.get_session_by_token(token or "")
+        session = auth_service.get_session_by_token(token or "") if token else None
         if session is None:
             return False
 

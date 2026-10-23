@@ -40,7 +40,7 @@ class Config:
     DATABASE_PATH = Path(
         os.environ.get(
             "SORALINK_DB_PATH",
-            str(BASE_DIR / "data" / "soralink.db"),
+            str(BASE_DIR / "instance" / "soralink.db"),
         )
     ).expanduser()
 
@@ -49,6 +49,10 @@ class Config:
         os.environ.get("SORALINK_SESSION_TTL_SECONDS", str(8 * 60 * 60))
     )
     CREW_CODE = os.environ.get("SORALINK_CREW_CODE")
+    SESSION_COOKIE_NAME = os.environ.get("SORALINK_COOKIE_NAME", "soralink_session")
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_SECURE = _env_bool("SORALINK_COOKIE_SECURE", False)
 
     # Local/offline server defaults.
     HOST = os.environ.get("SORALINK_HOST", "0.0.0.0")
@@ -80,9 +84,12 @@ class TestConfig(Config):
     DATABASE_PATH = Path(
         os.environ.get(
             "SORALINK_TEST_DB_PATH",
-            str(BASE_DIR / "data" / "soralink-test.db"),
+            os.environ.get(
+                "SORALINK_DB_PATH",
+                str(BASE_DIR / "instance" / "soralink-test.db"),
+            ),
         )
-    )
+    ).expanduser()
 
 
 class ProductionConfig(Config):

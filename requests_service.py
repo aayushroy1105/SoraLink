@@ -1,4 +1,3 @@
-
 """Request validation, persistence, queue ordering, and lifecycle."""
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from database import get_db, transaction
 
 BASE_DIR = Path(__file__).resolve().parent
 INTENTS_PATH = BASE_DIR / "data" / "intents.json"
+CREW_RESPONSES_PATH = BASE_DIR / "data" / "crew_responses.json"
 
 VALID_STATUSES = {"PENDING", "ACKNOWLEDGED", "COMPLETED"}
 
@@ -37,6 +37,10 @@ class InvalidTransitionError(RequestServiceError):
 
 class DuplicateActiveRequestError(RequestServiceError):
     """An active request for this seat and intent already exists."""
+
+
+class IdempotencyConflictError(RequestServiceError):
+    """The idempotency key was previously used for a different request."""
 
 
 def now_ms() -> int:
@@ -81,6 +85,17 @@ def load_intent_catalog() -> dict[str, dict[str, Any]]:
     return catalog
 
 
+def load_crew_responses() -> dict[str, dict[str, Any]]:
+    """Load the canonical crew responses dictionary."""
+    if not CREW_RESPONSES_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(CREW_RESPONSES_PATH.read_text(encoding="utf-8"))
+        return data.get("responses", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def validate_intent(intent_id: str) -> dict[str, Any]:
     """Return a canonical intent or reject an unknown ID."""
     if not isinstance(intent_id, str) or not intent_id:
@@ -123,22 +138,48 @@ def _require_crew(session: dict[str, Any]) -> str:
 
 
 def _request_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    """Convert a SQLite row to a plain dictionary."""
-    return dict(row)
+    """Convert a SQLite row to a plain dictionary matching contract conventions."""
+    item = dict(row)
+    item["request_id"] = item.get("id")
+    item["created_at"] = item.get("created_at_ms")
+    item["updated_at"] = item.get("updated_at_ms")
+    item["acknowledged_at"] = item.get("acknowledged_at_ms")
+    item["completed_at"] = item.get("completed_at_ms")
+
+    # Priority in uppercase for API response envelope
+    if "priority" in item and isinstance(item["priority"], str):
+        item["priority"] = item["priority"].upper()
+
+    intent_id = item.get("intent_id")
+    if intent_id:
+        try:
+            catalog = load_intent_catalog()
+            intent = catalog.get(intent_id)
+            if intent:
+                item["label"] = intent.get("label")
+                item["labels"] = {
+                    "en": intent.get("label", ""),
+                }
+        except Exception:
+            pass
+
+    return item
 
 
 def create_request(
     passenger_session: dict[str, Any],
     intent_id: str,
+    client_request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a visual/typed passenger request.
+    """Create a visual/typed passenger request with deduplication and idempotency.
 
     Seat and role come from the authenticated session, not the request body.
     Priority is loaded from the canonical intent catalog.
+    Returns request dictionary with 'was_created': True if newly inserted, False if deduplicated/idempotent.
     """
     session_id, seat_label = _require_passenger(passenger_session)
     intent = validate_intent(intent_id)
-    priority = intent["priority"]
+    priority = intent["priority"]  # 'urgent' or 'routine' for DB CHECK constraint
     timestamp = now_ms()
     request_id = str(uuid.uuid4())
 
@@ -162,6 +203,37 @@ def create_request(
                 if active_session is None:
                     raise PermissionError("Passenger session is no longer active")
 
+                # 1. Idempotency key validation if client_request_id was provided
+                if client_request_id:
+                    existing_events = connection.execute(
+                        """
+                        SELECT re.request_id, re.details_json, r.*
+                        FROM request_events re
+                        JOIN requests r ON re.request_id = r.id
+                        WHERE re.actor_session_id = ?
+                          AND re.event_type = 'CREATED'
+                        """,
+                        (session_id,),
+                    ).fetchall()
+
+                    for ev in existing_events:
+                        try:
+                            details = json.loads(ev["details_json"])
+                        except (TypeError, json.JSONDecodeError):
+                            details = {}
+                        if details.get("client_request_id") == client_request_id:
+                            if ev["intent_id"] == intent_id:
+                                # Idempotent replay of original request
+                                result = _request_from_row(ev)
+                                result["was_created"] = False
+                                return result
+                            else:
+                                # Conflicting reuse of idempotency key for different request
+                                raise IdempotencyConflictError(
+                                    "Idempotency key has already been used for a different request"
+                                )
+
+                # 2. Active-request deduplication: check for active request for same seat & intent
                 existing = connection.execute(
                     """
                     SELECT *
@@ -174,10 +246,12 @@ def create_request(
                 ).fetchone()
 
                 if existing is not None:
-                    raise DuplicateActiveRequestError(
-                        "An active request for this item already exists"
-                    )
+                    # Contract requirement: return existing active request
+                    result = _request_from_row(existing)
+                    result["was_created"] = False
+                    return result
 
+                # 3. Create new request
                 connection.execute(
                     """
                     INSERT INTO requests (
@@ -198,6 +272,10 @@ def create_request(
                     ),
                 )
 
+                event_details: dict[str, Any] = {"intent_id": intent_id}
+                if client_request_id:
+                    event_details["client_request_id"] = client_request_id
+
                 connection.execute(
                     """
                     INSERT INTO request_events (
@@ -209,20 +287,30 @@ def create_request(
                     (
                         request_id,
                         session_id,
-                        json.dumps({"intent_id": intent_id}),
+                        json.dumps(event_details),
                         timestamp,
                     ),
                 )
 
         except sqlite3.IntegrityError as exc:
-            # The unique partial index also protects against concurrent inserts.
+            # Handle concurrent race condition caught by idx_requests_no_active_duplicate
             if "idx_requests_no_active_duplicate" in str(exc) or (
                 "UNIQUE constraint failed: requests.seat_label, requests.intent_id"
                 in str(exc)
             ):
-                raise DuplicateActiveRequestError(
-                    "An active request for this item already exists"
-                ) from exc
+                with get_db() as conn:
+                    row = conn.execute(
+                        """
+                        SELECT * FROM requests
+                        WHERE seat_label = ? AND intent_id = ?
+                          AND status IN ('PENDING', 'ACKNOWLEDGED')
+                        """,
+                        (seat_label, intent_id),
+                    ).fetchone()
+                    if row is not None:
+                        result = _request_from_row(row)
+                        result["was_created"] = False
+                        return result
             raise
 
         row = connection.execute(
@@ -230,7 +318,9 @@ def create_request(
             (request_id,),
         ).fetchone()
 
-    return _request_from_row(row)
+    result = _request_from_row(row)
+    result["was_created"] = True
+    return result
 
 
 def list_crew_requests(
@@ -243,10 +333,8 @@ def list_crew_requests(
 
     if include_completed:
         status_filter = ""
-        params: tuple[Any, ...] = ()
     else:
         status_filter = "WHERE status IN ('PENDING', 'ACKNOWLEDGED')"
-        params = ()
 
     with get_db() as connection:
         rows = connection.execute(
@@ -258,8 +346,7 @@ def list_crew_requests(
                 CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,
                 created_at_ms ASC,
                 id ASC
-            """,
-            params,
+            """
         ).fetchall()
 
     return [_request_from_row(row) for row in rows]
@@ -301,13 +388,18 @@ def acknowledge_request(
     crew_session: dict[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
-    """Move a pending request to acknowledged."""
+    """Move a pending request to acknowledged. Repeated calls are handled idempotently."""
     crew_id = _require_crew(crew_session)
     timestamp = now_ms()
 
     with get_db() as connection:
         with transaction(connection):
             request = _get_request(connection, request_id)
+
+            if request["status"] == "ACKNOWLEDGED":
+                result = _request_from_row(request)
+                result["was_updated"] = False
+                return result
 
             if request["status"] != "PENDING":
                 raise InvalidTransitionError(
@@ -342,20 +434,32 @@ def acknowledge_request(
             (request_id,),
         ).fetchone()
 
-    return _request_from_row(row)
+    result = _request_from_row(row)
+    result["was_updated"] = True
+    return result
 
 
 def complete_request(
     crew_session: dict[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
-    """Move an acknowledged request to completed."""
+    """Move an acknowledged request to completed. Repeated calls are handled idempotently."""
     crew_id = _require_crew(crew_session)
     timestamp = now_ms()
 
     with get_db() as connection:
         with transaction(connection):
             request = _get_request(connection, request_id)
+
+            if request["status"] == "COMPLETED":
+                result = _request_from_row(request)
+                result["was_updated"] = False
+                return result
+
+            if request["status"] == "PENDING":
+                raise InvalidTransitionError(
+                    "A request must be acknowledged before completion"
+                )
 
             if request["status"] != "ACKNOWLEDGED":
                 raise InvalidTransitionError(
@@ -389,7 +493,9 @@ def complete_request(
             (request_id,),
         ).fetchone()
 
-    return _request_from_row(row)
+    result = _request_from_row(row)
+    result["was_updated"] = True
+    return result
 
 
 def request_follow_up(
@@ -448,6 +554,41 @@ def request_follow_up(
         ).fetchone()
 
     return _request_from_row(row)
+
+
+def get_request_events(request_id: str) -> list[dict[str, Any]]:
+    """Return all audit events for a request in chronological order."""
+    with get_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM request_events
+            WHERE request_id = ?
+            ORDER BY created_at_ms ASC, id ASC
+            """,
+            (request_id,),
+        ).fetchall()
+
+    events = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["details"] = json.loads(d["details_json"])
+        except Exception:
+            d["details"] = {}
+        events.append(d)
+    return events
+
+
+def get_request_by_id(request_id: str) -> dict[str, Any] | None:
+    """Retrieve a request by its primary key ID, or None if not found."""
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+
+    return _request_from_row(row) if row is not None else None
 
 
 # Short aliases for callers that use the API contract's terminology.

@@ -1,16 +1,18 @@
-
 """Persistent PA announcement lifecycle."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import sqlite3
 import time
-import uuid
 from typing import Any
+import uuid
 
 from database import get_db, transaction
 
 
+BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TTL_SECONDS = 120
 MAX_TTL_SECONDS = 30 * 60
 
@@ -36,6 +38,35 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+_PA_CARDS_CACHE: dict[str, dict[str, Any]] | None = None
+
+
+def load_pa_cards(reload: bool = False) -> dict[str, dict[str, Any]]:
+    """Load and return the fixed, approved PA card catalog from data/pa_cards.json."""
+    global _PA_CARDS_CACHE
+    if _PA_CARDS_CACHE is not None and not reload:
+        return _PA_CARDS_CACHE
+
+    cards_path = BASE_DIR / "data" / "pa_cards.json"
+    if not cards_path.is_file():
+        raise FileNotFoundError(f"PA card catalog not found at {cards_path}")
+
+    try:
+        data = json.loads(cards_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BroadcastServiceError(f"Failed to read PA card catalog: {exc}") from exc
+
+    cards_list = data.get("cards", [])
+    cards_map: dict[str, dict[str, Any]] = {}
+    for card in cards_list:
+        card_id = card.get("id")
+        if card_id:
+            cards_map[card_id] = card
+
+    _PA_CARDS_CACHE = cards_map
+    return cards_map
+
+
 def _require_crew(session: dict[str, Any]) -> str:
     """Return a crew session ID after checking the authenticated role."""
     if not isinstance(session, dict) or session.get("role") != "crew":
@@ -48,63 +79,93 @@ def _require_crew(session: dict[str, Any]) -> str:
     return session_id
 
 
-def _validate_text(
-    value: Any,
-    field_name: str,
-    max_length: int,
-) -> str:
-    if not isinstance(value, str):
-        raise InvalidBroadcastError(f"{field_name} must be text")
-
-    value = value.strip()
-
-    if not value:
-        raise InvalidBroadcastError(f"{field_name} is required")
-
-    if len(value) > max_length:
-        raise InvalidBroadcastError(
-            f"{field_name} must be at most {max_length} characters"
-        )
-
-    return value
-
-
 def _broadcast_from_row(
     row: sqlite3.Row | dict[str, Any],
+    current_time_ms: int | None = None,
 ) -> dict[str, Any]:
-    return dict(row)
+    """Serialize a database row into standard API and Socket.IO broadcast contract shapes."""
+    data = dict(row)
+    current_time = current_time_ms if current_time_ms is not None else now_ms()
+
+    broadcast_id = data.get("id", "")
+    ended_at = data.get("ended_at_ms")
+    expires_at = data.get("expires_at_ms", 0)
+    created_at = data.get("created_at_ms", 0)
+    pa_card_id = data.get("pa_card_id") or ""
+    title = data.get("title", "")
+    body = data.get("body", "")
+    category = data.get("category", "general")
+    created_by = data.get("created_by_session_id", "")
+
+    is_active = (ended_at is None) and (expires_at > current_time)
+
+    # Provide all canonical keys expected across API_CONTRACT, DATABASE_CONTRACT, and SOCKET_EVENTS
+    return {
+        "id": broadcast_id,
+        "broadcast_id": broadcast_id,
+        "pa_card_id": pa_card_id,
+        "title": title,
+        "body": body,
+        "category": category,
+        "created_by": created_by,
+        "created_by_session_id": created_by,
+        "created_at": created_at,
+        "created_at_ms": created_at,
+        "expires_at": expires_at,
+        "expires_at_ms": expires_at,
+        "ended_at": ended_at,
+        "ended_at_ms": ended_at,
+        "active_status": is_active,
+        "is_active": is_active,
+        "labels": {
+            "en": body,
+        },
+    }
 
 
 def create_broadcast(
     crew_session: dict[str, Any],
     *,
-    title: str,
-    body: str,
-    category: str = "general",
-    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    pa_card_id: str,
+    duration_seconds: int | None = None,
+    current_time_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Persist a crew announcement with a bounded expiration time."""
+    """Persist a crew announcement with an approved PA card and bounded expiration."""
     crew_id = _require_crew(crew_session)
 
-    title = _validate_text(title, "title", 100)
-    body = _validate_text(body, "body", 1000)
-    category = _validate_text(category, "category", 40)
+    if not pa_card_id or not isinstance(pa_card_id, str):
+        raise InvalidBroadcastError("pa_card_id is required")
 
-    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
-        raise InvalidBroadcastError("ttl_seconds must be an integer")
+    pa_card_id = pa_card_id.strip()
+    cards = load_pa_cards()
+    card = cards.get(pa_card_id)
+    if card is None:
+        raise InvalidBroadcastError(f"Unknown PA card ID: {pa_card_id}")
 
-    if not 1 <= ttl_seconds <= MAX_TTL_SECONDS:
+    # Resolve reviewed content and bounds from trusted catalog
+    title = card.get("title", "Announcement")
+    body = card.get("body", "")
+    category = card.get("category", "general")
+
+    if duration_seconds is None:
+        ttl = int(card.get("default_ttl_seconds", DEFAULT_TTL_SECONDS))
+    else:
+        if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int):
+            raise InvalidBroadcastError("duration_seconds must be an integer")
+        ttl = duration_seconds
+
+    if not 1 <= ttl <= MAX_TTL_SECONDS:
         raise InvalidBroadcastError(
-            f"ttl_seconds must be between 1 and {MAX_TTL_SECONDS}"
+            f"duration_seconds must be between 1 and {MAX_TTL_SECONDS}"
         )
 
-    timestamp = now_ms()
-    expires_at = timestamp + ttl_seconds * 1000
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
+    expires_at = timestamp + ttl * 1000
     broadcast_id = str(uuid.uuid4())
 
     with get_db() as connection:
         with transaction(connection):
-            # Ensure the crew session still exists and is active.
+            # Ensure the crew session still exists, is not revoked, and is active.
             active_session = connection.execute(
                 """
                 SELECT id
@@ -118,21 +179,20 @@ def create_broadcast(
             ).fetchone()
 
             if active_session is None:
-                raise BroadcastAuthorizationError(
-                    "Crew session is no longer active"
-                )
+                raise BroadcastAuthorizationError("Crew session is no longer active")
 
             connection.execute(
                 """
                 INSERT INTO active_broadcasts (
-                    id, title, body, category,
+                    id, pa_card_id, title, body, category,
                     created_by_session_id, created_at_ms,
                     expires_at_ms, ended_at_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     broadcast_id,
+                    pa_card_id,
                     title,
                     body,
                     category,
@@ -147,18 +207,17 @@ def create_broadcast(
             (broadcast_id,),
         ).fetchone()
 
-    return _broadcast_from_row(row)
+    return _broadcast_from_row(row, current_time_ms=timestamp)
 
 
-def list_active_broadcasts() -> list[dict[str, Any]]:
-    """Return announcements that are active at the current time."""
-    timestamp = now_ms()
+def list_active_broadcasts(current_time_ms: int | None = None) -> list[dict[str, Any]]:
+    """Return announcements that are active at the specified (or current) time."""
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
 
     with get_db() as connection:
         rows = connection.execute(
             """
-            SELECT id, title, body, category,
-                   created_at_ms, expires_at_ms
+            SELECT *
             FROM active_broadcasts
             WHERE ended_at_ms IS NULL
               AND expires_at_ms > ?
@@ -167,20 +226,53 @@ def list_active_broadcasts() -> list[dict[str, Any]]:
             (timestamp,),
         ).fetchall()
 
-    return [_broadcast_from_row(row) for row in rows]
+    return [_broadcast_from_row(row, current_time_ms=timestamp) for row in rows]
+
+
+def list_crew_broadcasts(
+    crew_session: dict[str, Any],
+    include_inactive: bool = False,
+    current_time_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """List broadcasts for crew review, optionally including inactive/ended broadcasts."""
+    _require_crew(crew_session)
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
+
+    with get_db() as connection:
+        if include_inactive:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM active_broadcasts
+                ORDER BY created_at_ms DESC, id DESC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM active_broadcasts
+                WHERE ended_at_ms IS NULL
+                  AND expires_at_ms > ?
+                ORDER BY created_at_ms DESC, id DESC
+                """,
+                (timestamp,),
+            ).fetchall()
+
+    return [_broadcast_from_row(row, current_time_ms=timestamp) for row in rows]
 
 
 def get_active_broadcast(
     broadcast_id: str,
+    current_time_ms: int | None = None,
 ) -> dict[str, Any] | None:
-    """Return one active announcement, or None if inactive or missing."""
-    timestamp = now_ms()
+    """Return one active announcement, or None if inactive, expired, or missing."""
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
 
     with get_db() as connection:
         row = connection.execute(
             """
-            SELECT id, title, body, category,
-                   created_at_ms, expires_at_ms
+            SELECT *
             FROM active_broadcasts
             WHERE id = ?
               AND ended_at_ms IS NULL
@@ -189,16 +281,17 @@ def get_active_broadcast(
             (broadcast_id, timestamp),
         ).fetchone()
 
-    return _broadcast_from_row(row) if row is not None else None
+    return _broadcast_from_row(row, current_time_ms=timestamp) if row is not None else None
 
 
 def end_broadcast(
     crew_session: dict[str, Any],
     broadcast_id: str,
+    current_time_ms: int | None = None,
 ) -> dict[str, Any]:
-    """End an active announcement and return its updated record."""
+    """End an announcement idempotently and return its updated record."""
     crew_id = _require_crew(crew_session)
-    timestamp = now_ms()
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
 
     with get_db() as connection:
         with transaction(connection):
@@ -215,45 +308,36 @@ def end_broadcast(
             ).fetchone()
 
             if active_session is None:
-                raise BroadcastAuthorizationError(
-                    "Crew session is no longer active"
-                )
+                raise BroadcastAuthorizationError("Crew session is no longer active")
 
             row = connection.execute(
-                """
-                SELECT *
-                FROM active_broadcasts
-                WHERE id = ?
-                  AND ended_at_ms IS NULL
-                  AND expires_at_ms > ?
-                """,
-                (broadcast_id, timestamp),
+                "SELECT * FROM active_broadcasts WHERE id = ?",
+                (broadcast_id,),
             ).fetchone()
 
             if row is None:
-                raise BroadcastNotFoundError(
-                    "Announcement is not active or does not exist"
-                )
+                raise BroadcastNotFoundError("Announcement does not exist")
 
-            connection.execute(
-                """
-                UPDATE active_broadcasts
-                SET ended_at_ms = ?
-                WHERE id = ?
-                  AND ended_at_ms IS NULL
-                """,
-                (timestamp, broadcast_id),
-            )
+            if row["ended_at_ms"] is None:
+                connection.execute(
+                    """
+                    UPDATE active_broadcasts
+                    SET ended_at_ms = ?
+                    WHERE id = ?
+                      AND ended_at_ms IS NULL
+                    """,
+                    (timestamp, broadcast_id),
+                )
 
         updated = connection.execute(
             "SELECT * FROM active_broadcasts WHERE id = ?",
             (broadcast_id,),
         ).fetchone()
 
-    return _broadcast_from_row(updated)
+    return _broadcast_from_row(updated, current_time_ms=timestamp)
 
 
-# Convenient aliases for route handlers.
+# Convenient aliases for route handlers
 get_active_broadcasts = list_active_broadcasts
 broadcast_announcement = create_broadcast
 end_announcement = end_broadcast

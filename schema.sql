@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS voice_previews (
     created_at_ms   INTEGER NOT NULL,
     expires_at_ms   INTEGER NOT NULL,
     consumed_at_ms  INTEGER,
+    request_id      TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id),
     CHECK (expires_at_ms > created_at_ms),
     CHECK (confidence IS NULL OR
@@ -145,6 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_voice_previews_expiry
 
 CREATE TABLE IF NOT EXISTS active_broadcasts (
     id                    TEXT PRIMARY KEY,
+    pa_card_id            TEXT,
     title                 TEXT NOT NULL,
     body                  TEXT NOT NULL,
     category              TEXT NOT NULL DEFAULT 'general',

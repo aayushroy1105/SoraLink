@@ -7,10 +7,16 @@ classification and passenger confirmation are separate steps.
 
 from __future__ import annotations
 
+import json
 import os
-import tempfile
 from pathlib import Path
+import sqlite3
+import tempfile
+import time
 from typing import Any
+import uuid
+
+from database import get_db, transaction
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -225,3 +231,128 @@ def reset_model() -> None:
     global _model, _model_key
     _model = None
     _model_key = None
+
+
+def now_ms() -> int:
+    """Return the current UTC Unix timestamp in milliseconds."""
+    return time.time_ns() // 1_000_000
+
+
+DEFAULT_PREVIEW_TTL_SECONDS = 30 * 60
+
+
+def _preview_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    raw_alts = data.get("alternatives_json", "[]")
+    try:
+        alternatives = json.loads(raw_alts) if isinstance(raw_alts, str) else raw_alts
+    except (json.JSONDecodeError, TypeError):
+        alternatives = []
+
+    return {
+        "id": data.get("id"),
+        "preview_id": data.get("id"),
+        "session_id": data.get("session_id"),
+        "transcript": data.get("transcript"),
+        "intent_id": data.get("intent_id"),
+        "confidence": data.get("confidence"),
+        "alternatives": alternatives,
+        "created_at_ms": data.get("created_at_ms"),
+        "expires_at_ms": data.get("expires_at_ms"),
+        "consumed_at_ms": data.get("consumed_at_ms"),
+        "request_id": data.get("request_id"),
+    }
+
+
+def create_voice_preview(
+    session_id: str,
+    transcript: str,
+    intent_id: str | None,
+    confidence: float | None,
+    alternatives: list[dict[str, Any]],
+    ttl_seconds: int = DEFAULT_PREVIEW_TTL_SECONDS,
+    current_time_ms: int | None = None,
+) -> dict[str, Any]:
+    """Persist an expiring voice preview bound to an authenticated session."""
+    preview_id = str(uuid.uuid4())
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
+    expires_at = timestamp + ttl_seconds * 1000
+    alternatives_json = json.dumps(alternatives)
+
+    with get_db() as connection:
+        with transaction(connection):
+            connection.execute(
+                """
+                INSERT INTO voice_previews (
+                    id, session_id, transcript, intent_id, confidence,
+                    alternatives_json, created_at_ms, expires_at_ms,
+                    consumed_at_ms, request_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    preview_id,
+                    session_id,
+                    transcript,
+                    intent_id,
+                    confidence,
+                    alternatives_json,
+                    timestamp,
+                    expires_at,
+                ),
+            )
+
+        row = connection.execute(
+            "SELECT * FROM voice_previews WHERE id = ?",
+            (preview_id,),
+        ).fetchone()
+
+    return _preview_from_row(row)
+
+
+def get_voice_preview(preview_id: str) -> dict[str, Any] | None:
+    """Retrieve a voice preview by ID."""
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM voice_previews WHERE id = ?",
+            (preview_id,),
+        ).fetchone()
+
+    return _preview_from_row(row) if row is not None else None
+
+
+def consume_voice_preview(
+    preview_id: str,
+    request_id: str,
+    current_time_ms: int | None = None,
+) -> None:
+    """Mark a preview as consumed by a created request."""
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
+    with get_db() as connection:
+        with transaction(connection):
+            connection.execute(
+                """
+                UPDATE voice_previews
+                SET consumed_at_ms = ?, request_id = ?
+                WHERE id = ?
+                """,
+                (timestamp, request_id, preview_id),
+            )
+
+
+def reject_voice_preview(
+    preview_id: str,
+    current_time_ms: int | None = None,
+) -> None:
+    """Mark a preview as rejected via none_of_these."""
+    timestamp = current_time_ms if current_time_ms is not None else now_ms()
+    with get_db() as connection:
+        with transaction(connection):
+            connection.execute(
+                """
+                UPDATE voice_previews
+                SET consumed_at_ms = ?, request_id = 'REJECTED'
+                WHERE id = ?
+                """,
+                (timestamp, preview_id),
+            )

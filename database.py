@@ -62,6 +62,17 @@ def init_db() -> None:
         connection.execute("PRAGMA journal_mode = WAL")
         schema = SCHEMA_PATH.read_text(encoding="utf-8")
         connection.executescript(schema)
+        # Ensure backwards-compatible column pa_card_id exists on active_broadcasts
+        cursor = connection.execute("PRAGMA table_info(active_broadcasts)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "pa_card_id" not in columns:
+            connection.execute("ALTER TABLE active_broadcasts ADD COLUMN pa_card_id TEXT")
+
+        # Ensure backwards-compatible column request_id exists on voice_previews
+        cursor = connection.execute("PRAGMA table_info(voice_previews)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "request_id" not in columns:
+            connection.execute("ALTER TABLE voice_previews ADD COLUMN request_id TEXT")
     finally:
         connection.close()
 

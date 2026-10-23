@@ -196,6 +196,85 @@ class IntentClassifier:
             )
             return False
 
+    KEYWORD_MAP = {
+        # Urgent intents
+        "medical_help": ["medical", "doctor", "heart", "chest pain", "bleeding", "emergency", "ambulance", "physician", "help"],
+        "motion_sickness": ["airsick", "vomit", "barf", "nausea", "throw up", "throwup", "queasy", "dizzy", "sick"],
+        "safety_concern": ["safety", "smoke", "fire", "danger", "hazard", "sparks"],
+        "accessibility_assist": ["wheelchair", "blind", "deaf", "mobility", "walk", "disabled"],
+        # Routine intents
+        "water_request": ["water", "drink", "thirsty", "hydrate", "mineral water"],
+        "blanket_request": ["blanket", "cold", "chilly", "freeze", "freezing"],
+        "pillow_request": ["pillow", "cushion", "headrest"],
+        "tea_coffee": ["tea", "coffee", "latte", "espresso", "cappuccino", "hot drink", "green tea"],
+        "bag_help": ["bag", "luggage", "overhead", "bin", "suitcase", "carry-on", "carryon"],
+        "headphone_request": ["headphone", "headphones", "earphone", "earphones", "earbuds", "audio jack"],
+        "meal_inquiry": ["meal", "food", "dinner", "lunch", "breakfast", "snack", "eat", "menu", "vegetarian"],
+        "lavatory_assist": ["lavatory", "toilet", "bathroom", "restroom", "wc"],
+        "seat_issue": ["seat", "recline", "seatbelt", "broken seat", "tray table", "armrest"],
+        "customs_form": ["customs", "immigration", "arrival form", "landing card", "passport control", "declaration"],
+        "baby_care": ["baby", "infant", "diaper", "nappy", "stroller", "bassinet", "formula", "bottle"],
+    }
+
+    def _match_rules(self, text: str) -> dict[str, Any] | None:
+        """Rule-based pattern matching for offline and urgent intent fallback."""
+        import re
+        lower = text.lower()
+        scores: dict[str, float] = {}
+        catalog_map = {item["id"]: item for item in self.catalog}
+
+        for intent_id, keywords in self.KEYWORD_MAP.items():
+            if intent_id not in catalog_map:
+                continue
+            for kw in keywords:
+                if re.search(r"\b" + re.escape(kw) + r"\b", lower):
+                    item = catalog_map[intent_id]
+                    base_score = 0.88 if item["priority"] == "urgent" else 0.85
+                    scores[intent_id] = max(scores.get(intent_id, 0.0), base_score)
+
+        if not scores:
+            return None
+
+        sorted_ids = sorted(
+            scores.keys(),
+            key=lambda i_id: (
+                scores[i_id],
+                1 if catalog_map[i_id]["priority"] == "urgent" else 0,
+            ),
+            reverse=True,
+        )
+
+        candidates = []
+        for i_id in sorted_ids:
+            item = catalog_map[i_id]
+            candidates.append({
+                "intent_id": i_id,
+                "label": item.get("label", i_id),
+                "priority": item["priority"],
+                "confidence": scores[i_id],
+            })
+
+        best = candidates[0]
+        if len(candidates) > 1 and candidates[0]["confidence"] == candidates[1]["confidence"] and candidates[0]["priority"] == candidates[1]["priority"]:
+            return {
+                "ok": False,
+                "intent_id": None,
+                "confidence": 0.50,
+                "alternatives": candidates[:3],
+                "needs_visual_fallback": True,
+                "reason": "ambiguous_match",
+            }
+
+        return {
+            "ok": True,
+            "intent_id": best["intent_id"],
+            "confidence": best["confidence"],
+            "priority": best["priority"],
+            "alternatives": candidates[1:4],
+            "needs_visual_fallback": False,
+            "reason": None,
+        }
+
     def classify(self, text: str) -> dict[str, Any]:
         """Suggest an intent and ranked alternatives for passenger review."""
         if not isinstance(text, str) or not text.strip():
@@ -209,6 +288,9 @@ class IntentClassifier:
             }
 
         if not self._load_model():
+            rule_match = self._match_rules(text)
+            if rule_match is not None:
+                return rule_match
             return {
                 "ok": False,
                 "intent_id": None,
@@ -237,6 +319,9 @@ class IntentClassifier:
         best = candidates[0] if candidates else None
 
         if best is None or best["confidence"] < self.confidence_threshold:
+            rule_match = self._match_rules(text)
+            if rule_match is not None and rule_match.get("priority") == "urgent":
+                return rule_match
             return {
                 "ok": False,
                 "intent_id": None,

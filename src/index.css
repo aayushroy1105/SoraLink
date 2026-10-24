@@ -1,0 +1,42 @@
+@import 'tailwindcss';
+
+@theme {
+  --breakpoint-xs: 25rem;
+  --font-serif-jp: 'Noto Serif JP', 'Shippori Mincho', serif;
+  --font-sans: 'Plus Jakarta Sans', 'Noto Sans Devanagari', 'Noto Sans Tamil', system-ui, -apple-system, sans-serif;
+
+  --color-ivory: #FAF8F3;
+  --color-ivory-light: #FFFDF9;
+  --color-ivory-dark: #F3EFE6;
+  --color-crimson: #C8102E;
+  --color-crimson-hover: #B00E28;
+  --color-crimson-dark: #8F0A20;
+  --color-crimson-light: #FBECEE;
+  --color-charcoal: #202124;
+  --color-charcoal-muted: #5F6368;
+  --color-charcoal-light: #80868B;
+  --color-sand: #EDE8DE;
+  --color-gold: #B8860B;
+  --color-gold-muted: #C5A059;
+}
+
+@layer base {
+  body {
+    background-color: #FAF8F3;
+    color: #202124;
+    font-family: 'Plus Jakarta Sans', 'Noto Sans Devanagari', 'Noto Sans Tamil', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+  button:focus-visible, [role='button']:focus-visible {
+    outline: 2px solid #C8102E;
+    outline-offset: 2px;
+  }
+}
+
+.bg-washi {
+  background-color: #FAF8F3;
+  background-image: radial-gradient(rgba(32, 33, 36, 0.03) 1px, transparent 1px);
+  background-size: 16px 16px;
+}

@@ -134,11 +134,14 @@ def test_voice_upload_validation(client: FlaskClient):
 # 2. Local Model Availability & Clear Failure Path
 # =============================================================================
 
-def test_local_whisper_unavailable_failure_path(client: FlaskClient):
-    """When faster-whisper or weights are not installed, a clear 503 is returned."""
+def test_local_whisper_unavailable_failure_path(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Returns a clear 503 when the local Whisper model is unavailable."""
     _login_passenger(client, seat_label="18A")
-
-    # Real un-mocked call in test environment where local Whisper model weights are absent
+    monkeypatch.setattr(voice, "init_voice_model", lambda *args, **kwargs: False)
+    # Simulate an unavailable local Whisper model without removing its weights.
     res = client.post(
         "/api/voice_request",
         data={"audio": (io.BytesIO(b"RIFF dummy wav data"), "test.wav", "audio/wav")},

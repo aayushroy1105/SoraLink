@@ -48,6 +48,7 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+
 def load_intent_catalog() -> dict[str, dict[str, Any]]:
     """Load and validate the canonical intent catalog."""
     if not INTENTS_PATH.is_file():
@@ -68,11 +69,16 @@ def load_intent_catalog() -> dict[str, dict[str, Any]]:
         if not isinstance(item, dict):
             raise RuntimeError("Each intent must be a JSON object")
 
-        intent_id = item.get("id")
+        # Support the AI branch's frozen catalog schema and the
+        # backend's existing normalized schema.
+        intent_id = item.get("id") or item.get("intent_id")
         priority = item.get("priority")
 
         if not isinstance(intent_id, str) or not intent_id:
             raise RuntimeError("Every intent must have a non-empty ID")
+
+        if isinstance(priority, str):
+            priority = priority.lower()
 
         if priority not in {"urgent", "routine"}:
             raise RuntimeError(f"Invalid priority for intent: {intent_id}")
@@ -80,9 +86,17 @@ def load_intent_catalog() -> dict[str, dict[str, Any]]:
         if intent_id in catalog:
             raise RuntimeError(f"Duplicate intent ID: {intent_id}")
 
-        catalog[intent_id] = item
+        normalized = {
+            **item,
+            "id": intent_id,
+            "priority": priority,
+            "label": item.get("label")
+            or item.get("labels", {}).get("en", intent_id),
+        }
+        catalog[intent_id] = normalized
 
     return catalog
+
 
 
 def load_crew_responses() -> dict[str, dict[str, Any]]:

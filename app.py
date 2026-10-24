@@ -294,105 +294,100 @@ def create_app(config_name=None):
             return failure("audio file is required", 400, "BAD_REQUEST")
 
         audio_file = request.files["audio"]
-        filename = audio_file.filename or ""
+        filename = (audio_file.filename or "").lower()
         content_type = audio_file.content_type or ""
 
-        # Infer content type from filename if generic or missing
+        # Infer a supported MIME type only when the browser omits it.
         if not content_type or content_type == "application/octet-stream":
-            lower_fn = filename.lower()
-            if lower_fn.endswith(".webm"):
-                content_type = "audio/webm"
-            elif lower_fn.endswith(".mp4") or lower_fn.endswith(".m4a"):
-                content_type = "audio/mp4"
-            elif lower_fn.endswith(".wav"):
-                content_type = "audio/wav"
-            elif lower_fn.endswith(".mp3"):
-                content_type = "audio/mp3"
-            elif lower_fn.endswith(".ogg"):
-                content_type = "audio/ogg"
-            elif lower_fn.endswith(".flac"):
-                content_type = "audio/flac"
-            else:
-                content_type = content_type or "application/octet-stream"
+            extensions = {
+                ".webm": "audio/webm",
+                ".mp4": "audio/mp4",
+                ".m4a": "audio/mp4",
+                ".wav": "audio/wav",
+                ".mp3": "audio/mpeg",
+                ".ogg": "audio/ogg",
+            }
+            content_type = next(
+                (mime for ext, mime in extensions.items() if filename.endswith(ext)),
+                content_type or "application/octet-stream",
+            )
 
         audio_bytes = audio_file.read()
-        if not audio_bytes:
-            return failure("No audio data was received", 400, "INVALID_AUDIO")
-
-        if len(audio_bytes) > voice.MAX_AUDIO_BYTES:
-            return failure("Audio upload exceeds the 15 MB limit", 413, "PAYLOAD_TOO_LARGE")
-
-        mime = content_type.split(";", 1)[0].strip().lower()
-        if mime not in voice.ALLOWED_AUDIO_TYPES:
-            return failure(f"Unsupported audio format: {mime}", 400, "INVALID_AUDIO")
-
-        language_hint = (
-            request.form.get("language_hint")
-            or request.form.get("language")
-        )
 
         try:
-            transcription = voice.transcribe_audio(
-                audio_bytes,
-                mime,
-                language=language_hint,
-            )
-        except voice.InvalidAudioError as exc:
-            return failure(str(exc), 400, "INVALID_AUDIO")
-        except voice.TranscriptionUnavailableError as exc:
-            return failure(str(exc), 503, "TRANSCRIPTION_UNAVAILABLE")
-        except voice.TranscriptionFailedError as exc:
-            return failure(str(exc), 422, "TRANSCRIPTION_FAILED")
-        except Exception as exc:
-            app.logger.exception("Voice transcription failed unexpectedly")
-            return failure("Audio transcription failed", 500, "INTERNAL_ERROR")
+            result = voice.process_voice_preview(audio_bytes, content_type)
+        except classifier.VoiceProcessingError as exc:
+            return failure(exc.message, exc.http_status, exc.code)
+        except Exception:
+            app.logger.exception("Voice preview processing failed unexpectedly")
+            return failure("Audio processing failed", 500, "INTERNAL_ERROR")
 
-        transcript = transcription.get("transcript", "").strip()
+        transcript = result.get("transcript", "").strip()
         if not transcript:
-            return failure("No speech could be recognized in the audio", 422, "TRANSCRIPTION_FAILED")
+            return failure(
+                "No clear speech was recognized. Please try again or tap a request card.",
+                422,
+                "SILENCE_OR_NO_SPEECH",
+            )
 
-        classification = classifier.classify_intent(transcript)
-        intent_id = classification.get("intent_id")
-        confidence = classification.get("confidence", 0.0)
-        alternatives = classification.get("alternatives", [])
-        threshold = classifier.get_confidence_threshold()
+        outcome = result.get("outcome", "UNRELIABLE")
+        suggested = result.get("suggested_intent")
+        candidates = result.get("candidates") or []
+        attributes = result.get("attributes") or {}
+        requires_choice = bool(result.get("requires_choice", True))
 
-        is_confident = (intent_id is not None) and (confidence is not None and confidence >= threshold)
+        catalog = {
+            item["id"]: item
+            for item in classifier.load_intent_catalog()
+        }
 
-        if not is_confident and not alternatives:
-            catalog = classifier.load_intent_catalog()
-            alternatives = [
-                {"intent_id": item["id"], "label": item.get("label", item["id"]), "priority": item["priority"]}
-                for item in catalog[:2]
-            ]
+        alternatives = []
+        for candidate in candidates:
+            intent_id = candidate.get("intent_id")
+            if not intent_id:
+                continue
+            item = catalog.get(intent_id, {})
+            alternatives.append({
+                "intent_id": intent_id,
+                "label": item.get("label", intent_id),
+                "priority": item.get("priority", "routine"),
+                "confidence": float(candidate.get("score", 0.0)),
+            })
+
+        # Only an explicit SUGGESTED outcome may preselect an intent.
+        intent_id = None
+        confidence = alternatives[0]["confidence"] if alternatives else 0.0
+        if outcome == "SUGGESTED" and suggested:
+            proposed_id = suggested.get("intent_id")
+            if proposed_id in catalog:
+                intent_id = proposed_id
+                confidence = float(suggested.get("score", confidence))
+            else:
+                outcome = "UNRELIABLE"
+                requires_choice = True
 
         preview = voice.create_voice_preview(
             session_id=session["id"],
             transcript=transcript,
-            intent_id=intent_id if is_confident else None,
+            intent_id=intent_id,
             confidence=confidence,
             alternatives=alternatives,
         )
 
-        if is_confident:
-            return success({
-                "preview_id": preview["id"],
-                "transcript": transcript,
-                "intent_id": intent_id,
-                "confidence": confidence,
-                "needs_confirmation": True,
-                "alternatives": alternatives,
-            })
-        else:
-            return success({
-                "preview_id": preview["id"],
-                "transcript": transcript,
-                "intent_id": None,
-                "confidence": confidence,
-                "needs_confirmation": True,
-                "alternatives": alternatives[:2],
-                "allow_none_of_these": True,
-            })
+        return success({
+            "preview_id": preview["id"],
+            "transcript": transcript,
+            "language": result.get("language"),
+            "intent_id": intent_id,
+            "confidence": confidence,
+            "needs_confirmation": True,
+            "alternatives": alternatives[:3],
+            "outcome": outcome,
+            "attributes": attributes,
+            "candidates": candidates,
+            "requires_choice": requires_choice,
+            "allow_none_of_these": intent_id is None,
+        })
 
     @app.post("/api/voice_request/confirm")
     @authenticated("passenger")
@@ -423,32 +418,46 @@ def create_app(config_name=None):
         if preview["expires_at_ms"] <= database.now_ms():
             return failure("Voice preview has expired", 410, "PREVIEW_EXPIRED")
 
-        # Rejection check
-        if preview["consumed_at_ms"] is not None and preview.get("request_id") == "REJECTED":
-            return failure("Preview was previously rejected", 409, "PREVIEW_REJECTED")
+                # Reject previously consumed previews, except for a valid idempotent retry.
+        if preview["consumed_at_ms"] is not None:
+            existing_req_id = preview.get("request_id")
 
-        # Idempotent repeated confirmation check
-        if preview["consumed_at_ms"] is not None and preview.get("request_id"):
-            existing_req_id = preview["request_id"]
-            existing_req = requests_service.get_request_by_id(existing_req_id)
-            if existing_req is not None:
-                if existing_req["intent_id"] == intent_id:
-                    return success({
-                        "request_id": existing_req["id"],
-                        "id": existing_req["id"],
-                        "seat_label": existing_req["seat_label"],
-                        "intent_id": existing_req["intent_id"],
-                        "status": existing_req["status"],
-                        "priority": existing_req["priority"].upper(),
-                        "created_at": existing_req["created_at_ms"],
-                        "request": existing_req,
-                    }, 200)
-                else:
+            if existing_req_id == "REJECTED":
+                return failure(
+                    "Preview was previously rejected",
+                    409,
+                    "PREVIEW_REJECTED",
+                )
+
+            if existing_req_id:
+                existing_req = requests_service.get_request_by_id(
+                    existing_req_id
+                )
+
+                if existing_req is not None:
+                    if existing_req["intent_id"] == intent_id:
+                        return success({
+                            "request_id": existing_req["id"],
+                            "id": existing_req["id"],
+                            "seat_label": existing_req["seat_label"],
+                            "intent_id": existing_req["intent_id"],
+                            "status": existing_req["status"],
+                            "priority": existing_req["priority"].upper(),
+                            "created_at": existing_req["created_at_ms"],
+                            "request": existing_req,
+                        }, 200)
+
                     return failure(
                         "Preview was already confirmed with a different intent",
                         409,
                         "PREVIEW_ALREADY_CONSUMED",
                     )
+
+            return failure(
+                "Preview has already been consumed",
+                409,
+                "PREVIEW_ALREADY_CONSUMED",
+            )
 
         # Validate intent ID and create request
         try:
@@ -531,6 +540,13 @@ def create_app(config_name=None):
         if preview["expires_at_ms"] <= database.now_ms():
             return failure("Voice preview has expired", 410, "PREVIEW_EXPIRED")
 
+        # A preview can only be rejected once.
+        if preview["consumed_at_ms"] is not None:
+            return failure(
+                "Preview has already been consumed",
+                409,
+                "PREVIEW_ALREADY_CONSUMED",
+            )
         voice.reject_voice_preview(preview_id)
 
         return success({

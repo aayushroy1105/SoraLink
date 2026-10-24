@@ -1,237 +1,434 @@
+"""Audio intake, local Whisper transcription and the voice-preview payload.
 
-"""Local audio processing and Whisper transcription.
+The backend owns everything downstream: this module validates the upload,
+transcribes it locally, classifies the text and returns a *preview* dictionary.
+It never writes to SQLite, never creates a passenger request and never bypasses
+passenger confirmation.
 
-Audio is processed locally. This module transcribes audio only;
-classification and passenger confirmation are separate steps.
+Public interface (used by ``app.py``)::
+
+    init_ai_models() -> dict          # load both models once at startup
+    get_ai_readiness() -> dict        # {"voice_model": ..., "classifier": ...}
+    process_voice_preview(bytes, mime) -> dict
 """
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
-import sqlite3
 import tempfile
+import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any
+
+import numpy as np
+
+from classifier import (
+    VoiceProcessingError,
+    classify_text,
+    get_classifier_readiness,
+    init_classifier,
+    load_intent_contract,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_WHISPER_DIR = PROJECT_ROOT / "models" / "whisper"
+
+MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MiB
+MAX_AUDIO_SECONDS = 20.0
+TARGET_AUDIO_SECONDS = 15.0
+SAMPLE_RATE = 16_000
+
+#: Allowlisted MIME types -> safe file extension. The client filename is ignored.
+MIME_EXTENSION_MAP: dict[str, str] = {
+    "audio/webm;codecs=opus": ".webm",
+    "audio/webm": ".webm",
+    "audio/mp4": ".mp4",
+    "audio/mp4;codecs=mp4a.40.2": ".m4a",
+    "audio/mp4;codecs=mp4a": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/mp4a-latm": ".m4a",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/ogg;codecs=opus": ".ogg",
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_CONCURRENT_INFERENCES = _env_int("SORALINK_MAX_CONCURRENT_INFERENCES", 1)
+SEMAPHORE_TIMEOUT_SECONDS = _env_float("SORALINK_SEMAPHORE_TIMEOUT", 2.0)
+
+#: One GPU, so one inference at a time by default.
+_INFERENCE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_INFERENCES)
+
+
+# --------------------------------------------------------------------------- #
+# Validation                                                                   #
+# --------------------------------------------------------------------------- #
+def canonical_mime_type(mime_type: str | None) -> str:
+    """Lowercase, drop spaces and extra parameters after the first codec group."""
+    if not mime_type:
+        return ""
+    raw = str(mime_type).split(",")[0].strip().lower().replace(" ", "")
+    return raw
+
+
+def resolve_audio_extension(mime_type: str | None) -> str:
+    """Return the safe extension for an allowlisted MIME type or raise."""
+    key = canonical_mime_type(mime_type)
+    # Exact matching only: an approved container with an unapproved codec
+    # (e.g. "audio/webm;codecs=vp9") is rejected rather than silently accepted.
+    extension = MIME_EXTENSION_MAP.get(key)
+    if extension is None:
+        raise VoiceProcessingError(
+            "UNSUPPORTED_AUDIO_TYPE",
+            "That audio format is not supported. Please record again in this browser.",
+            400,
+        )
+    return extension
+
+
+def validate_upload(audio_bytes: bytes | bytearray | None, mime_type: str | None) -> str:
+    """Validate size/type and return the safe extension. Never trusts filenames."""
+    if audio_bytes is None:
+        raise VoiceProcessingError(
+            "AUDIO_MISSING",
+            "No recording was received. Please record your request or tap a request card.",
+            400,
+        )
+    if not isinstance(audio_bytes, (bytes, bytearray)):
+        raise VoiceProcessingError(
+            "AUDIO_MISSING",
+            "No recording was received. Please record your request or tap a request card.",
+            400,
+        )
+    if len(audio_bytes) == 0:
+        raise VoiceProcessingError(
+            "AUDIO_MISSING",
+            "The recording was empty. Please try again or tap a request card.",
+            400,
+        )
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise VoiceProcessingError(
+            "AUDIO_TOO_LARGE",
+            "That recording is too large. Please record a shorter request.",
+            413,
+        )
+    return resolve_audio_extension(mime_type)
+
+
+# --------------------------------------------------------------------------- #
+# Whisper singleton                                                            #
+# --------------------------------------------------------------------------- #
+class _VoiceState:
+    model: Any = None
+    device: str | None = None
+    compute_type: str | None = None
+    load_error: str | None = None
+
+
+_VOICE = _VoiceState()
+_VOICE_LOCK = threading.Lock()
+
+
+def _whisper_dir() -> Path:
+    env_dir = os.environ.get("SORALINK_WHISPER_DIR")
+    return Path(env_dir) if env_dir else DEFAULT_WHISPER_DIR
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def init_voice_model(force: bool = False) -> bool:
+    """Load faster-whisper from ``./models/whisper`` once (CUDA, CPU fallback)."""
+    with _VOICE_LOCK:
+        if _VOICE.model is not None and not force:
+            return True
+        _VOICE.model = None
+        _VOICE.load_error = None
+
+        model_dir = _whisper_dir()
+        if not model_dir.exists():
+            _VOICE.load_error = "whisper weights not found"
+            return False
+
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:  # pragma: no cover - dependency missing
+            _VOICE.load_error = f"{type(exc).__name__}"
+            return False
+
+        attempts: list[tuple[str, str]] = []
+        if _cuda_available():
+            attempts.append(("cuda", "int8_float16"))
+        attempts.append(("cpu", "int8"))
+
+        last_error = "unknown"
+        for device, compute_type in attempts:
+            try:
+                model = WhisperModel(
+                    str(model_dir),
+                    device=device,
+                    compute_type=compute_type,
+                    local_files_only=True,
+                )
+            except Exception as exc:  # CUDA/cuDNN mismatch, corrupted weights, ...
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+            _VOICE.model = model
+            _VOICE.device = device
+            _VOICE.compute_type = compute_type
+            return True
+
+        _VOICE.load_error = last_error
+        return False
+
+
+def get_voice_readiness() -> str:
+    return "READY" if _VOICE.model is not None else "UNAVAILABLE"
+
+
+def get_ai_readiness() -> dict[str, str]:
+    """Startup/health payload. Deliberately free of paths and tracebacks."""
+    return {
+        "voice_model": get_voice_readiness(),
+        "classifier": get_classifier_readiness(),
+    }
+
+
+def init_ai_models(force: bool = False) -> dict[str, str]:
+    """Load Whisper and the SetFit classifier once, then report readiness.
+
+    Raises ``ValueError`` when ``data/intents.json`` violates the frozen
+    contract — that is a startup-time programming/merge error, not a passenger
+    error, so it must be loud rather than degraded.
+    """
+    load_intent_contract(refresh=force)
+    if force:
+        init_voice_model(force=True)
+        init_classifier(force=True)
+    else:
+        init_voice_model()
+        init_classifier()
+    return get_ai_readiness()
+
+
+# --------------------------------------------------------------------------- #
+# Temp-file + concurrency safety                                               #
+# --------------------------------------------------------------------------- #
+def _temp_audio_dir() -> Path:
+    directory = Path(tempfile.gettempdir()) / "soralink_audio"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:  # best effort on Windows; POSIX gets 0700
+        os.chmod(directory, 0o700)
+    except OSError:  # pragma: no cover - platform dependent
+        pass
+    return directory
+
+
+def _acquire_inference_slot() -> bool:
+    return _INFERENCE_SEMAPHORE.acquire(timeout=SEMAPHORE_TIMEOUT_SECONDS)
+
+
+def _release_inference_slot() -> None:
+    try:
+        _INFERENCE_SEMAPHORE.release()
+    except ValueError:  # pragma: no cover - defensive
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Transcription                                                               #
+# --------------------------------------------------------------------------- #
+def _decode_samples(path: Path) -> np.ndarray:
+    try:
+        from faster_whisper.audio import decode_audio  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - older layouts
+        from faster_whisper import decode_audio  # type: ignore[no-redef]
+
+    try:
+        samples = decode_audio(str(path), sampling_rate=SAMPLE_RATE)
+    except Exception as exc:
+        raise VoiceProcessingError(
+            "UNSUPPORTED_AUDIO_TYPE",
+            "The recording could not be read. Please record again or tap a request card.",
+            400,
+        ) from exc
+
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        raise VoiceProcessingError(
+            "SILENCE_OR_NO_SPEECH",
+            "No clear speech was detected. Please try again or tap a request card.",
+            422,
+        )
+    return samples
+
+
+def _transcribe(model: Any, samples: np.ndarray) -> tuple[str, str, float]:
+    duration = float(samples.size) / float(SAMPLE_RATE)
+    if duration > MAX_AUDIO_SECONDS:
+        raise VoiceProcessingError(
+            "AUDIO_TOO_LONG",
+            f"Recording is {duration:.1f}s; the maximum is {MAX_AUDIO_SECONDS:.0f} seconds.",
+            422,
+        )
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if duration < 0.25 or peak < 1e-3:
+        raise VoiceProcessingError(
+            "SILENCE_OR_NO_SPEECH",
+            "No clear speech was detected. Please try again or tap a request card.",
+            422,
+        )
+
+    segments, info = model.transcribe(
+        samples,
+        vad_filter=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+    parts = [segment.text.strip() for segment in segments if getattr(segment, "text", "").strip()]
+    transcript = " ".join(parts).strip()
+
+    info_duration = float(getattr(info, "duration", 0.0) or 0.0)
+    if info_duration > MAX_AUDIO_SECONDS:
+        raise VoiceProcessingError(
+            "AUDIO_TOO_LONG",
+            f"Recording is {info_duration:.1f}s; the maximum is {MAX_AUDIO_SECONDS:.0f} seconds.",
+            422,
+        )
+
+    language = str(getattr(info, "language", "") or "en").split("-")[0].lower()
+    if not transcript:
+        raise VoiceProcessingError(
+            "SILENCE_OR_NO_SPEECH",
+            "No clear speech was detected. Please try again or tap a request card.",
+            422,
+        )
+    return transcript, language, max(duration, info_duration)
+
+
+# --------------------------------------------------------------------------- #
+# Public entrypoint                                                            #
+# --------------------------------------------------------------------------- #
+def process_voice_preview(audio_bytes: bytes, mime_type: str) -> dict[str, Any]:
+    """Turn an uploaded recording into a structured preview for the backend.
+
+    Raises :class:`VoiceProcessingError` with a frozen ``code`` and HTTP status on
+    every failure path. The temp file is removed in a ``finally`` block whether
+    transcription succeeds or fails.
+    """
+    extension = validate_upload(audio_bytes, mime_type)
+
+    if not _acquire_inference_slot():
+        raise VoiceProcessingError(
+            "MODEL_BUSY",
+            "Voice recognition is currently busy. Please retry or use a request card.",
+            503,
+        )
+
+    temp_path: Path | None = None
+    try:
+        if not init_voice_model():
+            raise VoiceProcessingError(
+                "MODEL_UNAVAILABLE",
+                "Voice recognition is not available right now. Please tap a request card.",
+                503,
+            )
+
+        temp_path = _temp_audio_dir() / f"soralink_audio_{uuid.uuid4().hex}{extension}"
+        with open(temp_path, "wb") as handle:
+            handle.write(audio_bytes)
+
+        started = time.perf_counter()
+        samples = _decode_samples(temp_path)
+        transcript, language, duration = _transcribe(_VOICE.model, samples)
+        classification = classify_text(transcript)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+
+        # Structured preview only — persistence and confirmation belong to the backend.
+        result: dict[str, Any] = {
+            "transcript": classification["transcript"],
+            "language": language,
+            "suggested_intent": classification["suggested_intent"],
+            "attributes": classification["attributes"],
+            "candidates": classification["candidates"],
+            "outcome": classification["outcome"],
+            "requires_choice": classification["requires_choice"],
+        }
+        # Telemetry for logs only; excluded from the HTTP body by app.py if desired.
+        result_meta = {
+            "duration_seconds": round(duration, 2),
+            "processing_ms": elapsed_ms,
+            "device": _VOICE.device,
+        }
+        _LAST_PREVIEW_META.clear()
+        _LAST_PREVIEW_META.update(result_meta)
+        return result
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:  # pragma: no cover - Windows file lock
+                pass
+        _release_inference_slot()
+
+
+#: Last preview diagnostics (timing/device) for scripts; never part of the API body.
+_LAST_PREVIEW_META: dict[str, Any] = {}
+
+
+__all__ = [
+    "MAX_AUDIO_BYTES",
+    "MAX_AUDIO_SECONDS",
+    "MIME_EXTENSION_MAP",
+    "VoiceProcessingError",
+    "canonical_mime_type",
+    "get_ai_readiness",
+    "get_voice_readiness",
+    "init_ai_models",
+    "process_voice_preview",
+    "resolve_audio_extension",
+    "validate_upload",
+]
+
+
+import json
+import sqlite3
+import time
 import uuid
 
 from database import get_db, transaction
 
-
-BASE_DIR = Path(__file__).resolve().parent
-
-DEFAULT_MODEL_PATH = BASE_DIR / "models" / "whisper"
-MAX_AUDIO_BYTES = 15 * 1024 * 1024
-
-ALLOWED_AUDIO_TYPES = {
-    "audio/webm",
-    "audio/mp4",
-    "audio/mpeg",
-    "audio/wav",
-    "audio/x-wav",
-    "audio/ogg",
-    "audio/flac",
-    "audio/mp3",
-}
-
-AUDIO_EXTENSIONS = {
-    "audio/webm": ".webm",
-    "audio/mp4": ".mp4",
-    "audio/mpeg": ".mp3",
-    "audio/mp3": ".mp3",
-    "audio/wav": ".wav",
-    "audio/x-wav": ".wav",
-    "audio/ogg": ".ogg",
-    "audio/flac": ".flac",
-}
-
-
-class VoiceProcessingError(Exception):
-    """Base exception for voice processing failures."""
-
-
-class InvalidAudioError(VoiceProcessingError):
-    """Raised when uploaded audio is invalid or unsupported."""
-
-
-class TranscriptionUnavailableError(VoiceProcessingError):
-    """Raised when the local transcription engine cannot be loaded."""
-
-
-class TranscriptionFailedError(VoiceProcessingError):
-    """Raised when audio transcription fails."""
-
-
-_model = None
-_model_key: tuple[str, str] | None = None
-
-
-def _get_model_path() -> Path:
-    configured = os.environ.get("SORALINK_WHISPER_MODEL_PATH")
-    return Path(configured).expanduser() if configured else DEFAULT_MODEL_PATH
-
-
-def _get_model():
-    """Load a local faster-whisper model once; never download a model."""
-    global _model, _model_key
-
-    model_path = _get_model_path()
-    device = os.environ.get("SORALINK_WHISPER_DEVICE", "cpu").strip()
-    compute_type = os.environ.get(
-        "SORALINK_WHISPER_COMPUTE_TYPE", "int8"
-    ).strip()
-
-    key = (str(model_path.resolve()), f"{device}:{compute_type}")
-
-    if _model is not None and _model_key == key:
-        return _model
-
-    if not model_path.exists():
-        raise TranscriptionUnavailableError(
-            "Local Whisper model not found. Configure "
-            "SORALINK_WHISPER_MODEL_PATH before using voice requests."
-        )
-
-    try:
-        from faster_whisper import WhisperModel
-
-        _model = WhisperModel(
-            str(model_path),
-            device=device,
-            compute_type=compute_type,
-            local_files_only=True,
-        )
-        _model_key = key
-        return _model
-    except Exception as exc:
-        _model = None
-        _model_key = None
-        raise TranscriptionUnavailableError(
-            "The local Whisper model could not be loaded."
-        ) from exc
-
-
-def _normalise_audio_type(content_type: str | None) -> str:
-    """Return the base MIME type without parameters."""
-    if not content_type:
-        raise InvalidAudioError("Audio content type is required")
-
-    return content_type.split(";", 1)[0].strip().lower()
-
-
-def transcribe_audio(
-    audio_bytes: bytes,
-    content_type: str,
-    *,
-    language: str | None = None,
-) -> dict[str, Any]:
-    """Transcribe uploaded audio using a locally installed Whisper model.
-
-    Args:
-        audio_bytes: Raw encoded audio bytes from the client.
-        content_type: Browser-reported MIME type.
-        language: Optional language code, such as 'en' or 'ja'.
-
-    Returns:
-        A dictionary containing transcript, detected language,
-        and an optional language probability.
-
-    Raises:
-        InvalidAudioError: The upload is invalid or unsupported.
-        TranscriptionUnavailableError: The local model is unavailable.
-        TranscriptionFailedError: Transcription failed.
-    """
-    if not isinstance(audio_bytes, bytes) or not audio_bytes:
-        raise InvalidAudioError("No audio data was received")
-
-    if len(audio_bytes) > MAX_AUDIO_BYTES:
-        raise InvalidAudioError("Audio upload exceeds the 15 MB limit")
-
-    mime_type = _normalise_audio_type(content_type)
-
-    if mime_type not in ALLOWED_AUDIO_TYPES:
-        raise InvalidAudioError(
-            f"Unsupported audio format: {mime_type}"
-        )
-
-    if language is not None:
-        if not isinstance(language, str) or not language.strip():
-            raise InvalidAudioError("Language must be a non-empty language code")
-        language = language.strip().lower()
-
-        if len(language) > 12:
-            raise InvalidAudioError("Language code is too long")
-
-    model = _get_model()
-    extension = AUDIO_EXTENSIONS[mime_type]
-    temporary_path: str | None = None
-
-    try:
-        # Each request gets a unique temporary file.
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            suffix=extension,
-            prefix="soralink-audio-",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = temporary_file.name
-            temporary_file.write(audio_bytes)
-
-        segments, info = model.transcribe(
-            temporary_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-        )
-
-        # Segment generation can fail lazily, so iterate inside try/finally.
-        parts = []
-        for segment in segments:
-            text = segment.text.strip()
-            if text:
-                parts.append(text)
-
-        transcript = " ".join(parts).strip()
-
-        if not transcript:
-            raise TranscriptionFailedError(
-                "No speech could be recognized in the audio"
-            )
-
-        language_probability = getattr(info, "language_probability", None)
-
-        return {
-            "transcript": transcript,
-            "language": getattr(info, "language", None),
-            "language_probability": (
-                float(language_probability)
-                if language_probability is not None
-                else None
-            ),
-        }
-
-    except VoiceProcessingError:
-        raise
-    except Exception as exc:
-        raise TranscriptionFailedError(
-            "Audio transcription failed"
-        ) from exc
-    finally:
-        if temporary_path is not None:
-            try:
-                Path(temporary_path).unlink(missing_ok=True)
-            except OSError:
-                # Do not expose a temporary path or audio bytes to clients.
-                pass
-
-
-def reset_model() -> None:
-    """Reset the cached model, useful for tests and model replacement."""
-    global _model, _model_key
-    _model = None
-    _model_key = None
-
+DEFAULT_PREVIEW_TTL_SECONDS = 30 * 60
 
 def now_ms() -> int:
     """Return the current UTC Unix timestamp in milliseconds."""

@@ -18,6 +18,9 @@ Covers:
 from __future__ import annotations
 
 import io
+import math
+import wave
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 import pytest
@@ -105,7 +108,7 @@ def test_voice_upload_validation(client: FlaskClient):
         content_type="multipart/form-data",
     )
     assert res_empty.status_code == 400
-    assert res_empty.json["error"]["code"] == "INVALID_AUDIO"
+    assert res_empty.json["error"]["code"] == "AUDIO_MISSING"
 
     # Unsupported format
     res_bad_format = client.post(
@@ -114,7 +117,7 @@ def test_voice_upload_validation(client: FlaskClient):
         content_type="multipart/form-data",
     )
     assert res_bad_format.status_code == 400
-    assert res_bad_format.json["error"]["code"] == "INVALID_AUDIO"
+    assert res_bad_format.json["error"]["code"] == "UNSUPPORTED_AUDIO_TYPE"
 
     # Oversized upload (> 15 MB)
     large_payload = b"0" * (16 * 1024 * 1024)
@@ -143,7 +146,7 @@ def test_local_whisper_unavailable_failure_path(client: FlaskClient):
     )
     assert res.status_code == 503
     assert res.json["ok"] is False
-    assert res.json["error"]["code"] == "TRANSCRIPTION_UNAVAILABLE"
+    assert res.json["error"]["code"] == "MODEL_UNAVAILABLE"
 
     # Verify visual request flow remains 100% operational
     res_visual = client.post("/api/requests", json={"intent_id": "water_request"})
@@ -155,22 +158,46 @@ def test_local_whisper_unavailable_failure_path(client: FlaskClient):
 # 3. Mocked Pipeline: Transcription & Intent Classification
 # =============================================================================
 
-def test_mocked_transcription_and_approved_intent(client: FlaskClient, monkeypatch: pytest.MonkeyPatch):
-    """Mocked local transcription returns transcript, approved intent suggestion, and preview."""
+
+def test_mocked_transcription_and_approved_intent(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Mock AI voice processing and verify the suggested intent and persisted preview."""
     _login_passenger(client, seat_label="18A")
 
-    # Mock transcription engine
     monkeypatch.setattr(
         voice,
-        "transcribe_audio",
-        lambda *args, **kwargs: {"transcript": "Can I please have some water?", "language": "en"},
+        "process_voice_preview",
+        lambda *args, **kwargs: {
+            "transcript": "Can I please have some water?",
+            "language": "en",
+            "outcome": "SUGGESTED",
+            "suggested_intent": {
+                "intent_id": "water_request",
+                "score": 0.8812,
+            },
+            "candidates": [
+                {"intent_id": "water_request", "score": 0.8812},
+                {"intent_id": "meal_inquiry", "score": 0.05},
+            ],
+            "attributes": {},
+            "requires_choice": False,
+        },
     )
 
     res = client.post(
         "/api/voice_request",
-        data={"audio": (io.BytesIO(b"audio bytes"), "input.webm", "audio/webm")},
+        data={
+            "audio": (
+                io.BytesIO(b"audio bytes"),
+                "input.webm",
+                "audio/webm",
+            )
+        },
         content_type="multipart/form-data",
     )
+
     assert res.status_code == 200
     data = res.json["data"]
 
@@ -180,13 +207,14 @@ def test_mocked_transcription_and_approved_intent(client: FlaskClient, monkeypat
     assert data["needs_confirmation"] is True
     assert data["preview_id"]
 
-    # Verify preview was persisted durably in database
+    # Verify preview was persisted durably in the database.
     conn = get_connection()
     try:
         row = conn.execute(
             "SELECT * FROM voice_previews WHERE id = ?",
             (data["preview_id"],),
         ).fetchone()
+
         assert row is not None
         assert row["transcript"] == "Can I please have some water?"
         assert row["intent_id"] == "water_request"
@@ -196,49 +224,91 @@ def test_mocked_transcription_and_approved_intent(client: FlaskClient, monkeypat
         conn.close()
 
 
-def test_empty_transcript_handling(client: FlaskClient, monkeypatch: pytest.MonkeyPatch):
-    """Empty or whitespace-only transcription raises 422 without creating preview."""
+
+def test_empty_transcript_handling(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Empty or whitespace-only transcription returns 422 without creating a preview."""
     _login_passenger(client, seat_label="18A")
 
     monkeypatch.setattr(
         voice,
-        "transcribe_audio",
-        lambda *args, **kwargs: {"transcript": "   ", "language": "en"},
+        "process_voice_preview",
+        lambda *args, **kwargs: {
+            "transcript": "   ",
+            "language": "en",
+            "outcome": "UNRELIABLE",
+            "suggested_intent": None,
+            "candidates": [],
+            "attributes": {},
+            "requires_choice": True,
+        },
     )
 
     res = client.post(
         "/api/voice_request",
-        data={"audio": (io.BytesIO(b"audio bytes"), "silence.webm", "audio/webm")},
+        data={
+            "audio": (
+                io.BytesIO(b"audio bytes"),
+                "silence.webm",
+                "audio/webm",
+            )
+        },
         content_type="multipart/form-data",
     )
-    assert res.status_code == 422
-    assert res.json["error"]["code"] == "TRANSCRIPTION_FAILED"
 
-    # Confirm no preview row exists in DB
+    assert res.status_code == 422
+    assert res.json["error"]["code"] == "SILENCE_OR_NO_SPEECH"
+
+    # Confirm no preview row exists in the database.
     conn = get_connection()
     try:
-        count = conn.execute("SELECT COUNT(*) FROM voice_previews").fetchone()[0]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM voice_previews"
+        ).fetchone()[0]
         assert count == 0
     finally:
         conn.close()
 
 
-def test_low_confidence_and_ambiguous_matches(client: FlaskClient, monkeypatch: pytest.MonkeyPatch):
-    """Low-confidence or ambiguous matches offer alternatives without pre-selecting intent."""
+
+def test_low_confidence_and_ambiguous_matches(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Ambiguous matches offer alternatives without pre-selecting an intent."""
     _login_passenger(client, seat_label="18A")
 
-    # Ambiguous speech with no distinct keyword
     monkeypatch.setattr(
         voice,
-        "transcribe_audio",
-        lambda *args, **kwargs: {"transcript": "I need something right now", "language": "en"},
+        "process_voice_preview",
+        lambda *args, **kwargs: {
+            "transcript": "I need something right now",
+            "language": "en",
+            "outcome": "UNRELIABLE",
+            "suggested_intent": None,
+            "candidates": [
+                {"intent_id": "water_request", "score": 0.34},
+                {"intent_id": "meal_inquiry", "score": 0.32},
+            ],
+            "attributes": {},
+            "requires_choice": True,
+        },
     )
 
     res = client.post(
         "/api/voice_request",
-        data={"audio": (io.BytesIO(b"audio bytes"), "ambiguous.webm", "audio/webm")},
+        data={
+            "audio": (
+                io.BytesIO(b"audio bytes"),
+                "ambiguous.webm",
+                "audio/webm",
+            )
+        },
         content_type="multipart/form-data",
     )
+
     assert res.status_code == 200
     data = res.json["data"]
 
@@ -249,39 +319,61 @@ def test_low_confidence_and_ambiguous_matches(client: FlaskClient, monkeypatch: 
     assert len(data["alternatives"]) >= 1
 
 
-def test_urgent_expression_classification(client: FlaskClient, monkeypatch: pytest.MonkeyPatch):
+def test_urgent_expression_classification(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Recognized urgent phrases are classified as urgent and surfaced."""
     _login_passenger(client, seat_label="18A")
 
-    # Medical emergency expression
-    monkeypatch.setattr(
-        voice,
-        "transcribe_audio",
-        lambda *args, **kwargs: {"transcript": "Help me I am having chest pain and need a doctor", "language": "en"},
-    )
+    urgent_cases = [
+        (
+            "Help me I am having chest pain and need a doctor",
+            "medical_help",
+        ),
+        (
+            "I feel airsick and I think I am going to vomit",
+            "motion_sickness",
+        ),
+    ]
 
-    res = client.post(
-        "/api/voice_request",
-        data={"audio": (io.BytesIO(b"audio"), "urgent.webm", "audio/webm")},
-        content_type="multipart/form-data",
-    )
-    assert res.status_code == 200
-    assert res.json["data"]["intent_id"] == "medical_help"
+    for transcript, intent_id in urgent_cases:
+        monkeypatch.setattr(
+            voice,
+            "process_voice_preview",
+            lambda *args, _transcript=transcript, _intent_id=intent_id, **kwargs: {
+                "transcript": _transcript,
+                "language": "en",
+                "outcome": "SUGGESTED",
+                "suggested_intent": {
+                    "intent_id": _intent_id,
+                    "score": 0.95,
+                },
+                "candidates": [
+                    {"intent_id": _intent_id, "score": 0.95},
+                ],
+                "attributes": {},
+                "requires_choice": False,
+            },
+        )
 
-    # Motion sickness expression
-    monkeypatch.setattr(
-        voice,
-        "transcribe_audio",
-        lambda *args, **kwargs: {"transcript": "I feel airsick and I think I am going to vomit", "language": "en"},
-    )
+        res = client.post(
+            "/api/voice_request",
+            data={
+                "audio": (
+                    io.BytesIO(b"audio bytes"),
+                    "urgent.webm",
+                    "audio/webm",
+                )
+            },
+            content_type="multipart/form-data",
+        )
 
-    res_sick = client.post(
-        "/api/voice_request",
-        data={"audio": (io.BytesIO(b"audio"), "sick.webm", "audio/webm")},
-        content_type="multipart/form-data",
-    )
-    assert res_sick.status_code == 200
-    assert res_sick.json["data"]["intent_id"] == "motion_sickness"
+        assert res.status_code == 200
+        data = res.json["data"]
+        assert data["transcript"] == transcript
+        assert data["intent_id"] == intent_id
+        assert data["needs_confirmation"] is True
 
 
 # =============================================================================
@@ -495,32 +587,37 @@ def test_none_of_these_fallback_behavior(client: FlaskClient):
 # 6. Audio Temporary File Cleanup
 # =============================================================================
 
-def test_temporary_audio_file_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Temporary audio files are deleted in finally block even on failure."""
-    created_tempfiles: list[str] = []
+def test_temporary_audio_file_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Temporary audio files are deleted even when audio decoding fails."""
+    monkeypatch.setattr(voice, "_temp_audio_dir", lambda: tmp_path)
+    monkeypatch.setattr(voice, "_acquire_inference_slot", lambda: True)
+    monkeypatch.setattr(voice, "_release_inference_slot", lambda: None)
+    monkeypatch.setattr(voice, "init_voice_model", lambda: True)
 
-    # Spy on NamedTemporaryFile
-    import tempfile
-    orig_named_tempfile = tempfile.NamedTemporaryFile
+    class FakeVoiceState:
+        model = object()
+        device = "cpu"
 
-    def spy_tempfile(*args, **kwargs):
-        tf = orig_named_tempfile(*args, **kwargs)
-        created_tempfiles.append(tf.name)
-        return tf
+    monkeypatch.setattr(voice, "_VOICE", FakeVoiceState())
 
-    monkeypatch.setattr(tempfile, "NamedTemporaryFile", spy_tempfile)
+    def fail_decoding(*args, **kwargs):
+        raise voice.VoiceProcessingError(
+            "UNSUPPORTED_AUDIO_TYPE",
+            "Simulated decoding failure",
+            400,
+        )
 
-    # Force model load to fail after writing tempfile
-    class FailingModel:
-        def transcribe(self, *args, **kwargs):
-            raise RuntimeError("Model runtime crash during transcription")
+    monkeypatch.setattr(voice, "_decode_samples", fail_decoding)
 
-    monkeypatch.setattr(voice, "_get_model", lambda: FailingModel())
+    with pytest.raises(
+        voice.VoiceProcessingError,
+        match="Simulated decoding failure",
+    ):
+        voice.process_voice_preview(b"fake audio data", "audio/webm")
 
-    with pytest.raises(voice.TranscriptionFailedError):
-        voice.transcribe_audio(b"fake audio data", "audio/webm")
-
-    # Verify the temporary file was cleaned up and does not exist on disk
-    assert len(created_tempfiles) == 1
-    tempfile_path = Path(created_tempfiles[0])
-    assert not tempfile_path.exists(), f"Temporary file {tempfile_path} was not cleaned up!"
+    assert list(tmp_path.iterdir()) == [], (
+        "Temporary audio files were not cleaned up!"
+    )

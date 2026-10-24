@@ -3,21 +3,3 @@ Flask-SocketIO
 simple-websocket==1.0.0
 itsdangerous
 pytest
-
-# --- SoraLink AI & audio stack (voice.py, classifier.py) ---
-# The CUDA build of torch must come from the PyTorch index so the RTX 5060 is used;
-# plain PyPI torch on Windows is CPU-only:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
-torch>=2.7,<3.0
-faster-whisper>=1.1
-ctranslate2>=4.5
-# PyAV 19 dropped the metadata_errors argument faster-whisper passes to av.open().
-av>=11,<19
-setfit>=1.1
-sentence-transformers>=3.0
-transformers>=4.44
-datasets>=2.20
-scikit-learn>=1.4
-numpy>=1.26
-soundfile>=0.12
-pytest>=8.0

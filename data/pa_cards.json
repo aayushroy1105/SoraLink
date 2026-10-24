@@ -1,1 +1,49 @@
 
+
+{
+  "version": "1.0",
+  "cards": [
+    {
+      "id": "boarding_update",
+      "title": "Boarding update",
+      "body": "Boarding is in progress. Please follow the crew's instructions and keep the aisle clear.",
+      "category": "boarding",
+      "default_ttl_seconds": 120
+    },
+    {
+      "id": "turbulence",
+      "title": "Turbulence reminder",
+      "body": "We are expecting turbulence. Please return to your seat and fasten your seat belt.",
+      "category": "safety",
+      "default_ttl_seconds": 180
+    },
+    {
+      "id": "cabin_crew_assistance",
+      "title": "Crew assistance",
+      "body": "A crew member is assisting another passenger. Thank you for your patience.",
+      "category": "service",
+      "default_ttl_seconds": 120
+    },
+    {
+      "id": "meal_service",
+      "title": "Meal service",
+      "body": "Meal and beverage service is in progress. Please use SoraLink to submit a service request.",
+      "category": "service",
+      "default_ttl_seconds": 180
+    },
+    {
+      "id": "lavatory_queue",
+      "title": "Lavatory reminder",
+      "body": "Please follow crew guidance when waiting to use the lavatory, and keep the aisle clear.",
+      "category": "cabin",
+      "default_ttl_seconds": 120
+    },
+    {
+      "id": "arrival_preparation",
+      "title": "Arrival preparation",
+      "body": "We will be preparing for arrival shortly. Please follow crew instructions and ensure your seat belt is fastened when requested.",
+      "category": "arrival",
+      "default_ttl_seconds": 180
+    }
+  ]
+}

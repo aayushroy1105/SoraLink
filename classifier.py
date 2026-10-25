@@ -94,11 +94,19 @@ _STOPWORDS = frozenset(
         "इस", "उस", "एक", "कुछ", "बहुत", "थोड़ा", "थोड़ी", "कृपया", "जी", "लिए",
         "वाला", "वाली", "वाले", "गया", "गई", "हुआ", "हुई", "होने", "कर", "करने",
         "चाहिए", "चाहता", "चाहती", "दीजिए", "कीजिए", "बताइए", "पड़ा", "पड़ी",
+        "कौन", "सा", "सी", "दिया", "देना", "भर", "अब", "किसको", "किस", "कहाँ", "कब",
+        "कैसे", "क्यों", "सकता", "सकती", "सकते", "मुझे", "मेरा", "मेरी", "मेरे",
+        "हमारा", "हमारी", "हमारे", "आप", "आपका", "आपकी", "आपके", "अपना", "अपनी",
+        "साथ", "ऊपर", "नीचे", "करना", "किया", "होना", "होगा",
         # Gurmukhi function words.
         "ਹੈ", "ਹਨ", "ਸੀ", "ਵਿੱਚ", "ਨੂੰ", "ਦਾ", "ਦੀ", "ਦੇ", "ਤੋਂ", "ਤੇ", "ਲਈ",
         "ਵਾਲਾ", "ਵਾਲੀ", "ਵਾਲੇ", "ਕਿ", "ਵੀ", "ਨਹੀਂ", "ਕੀ", "ਇਹ", "ਉਹ", "ਇੱਕ",
         "ਕੁਝ", "ਬਹੁਤ", "ਥੋੜ੍ਹਾ", "ਗਿਆ", "ਗਈ", "ਕਰੋ", "ਕਰ", "ਕਰਨ", "ਚਾਹੀਦਾ",
         "ਚਾਹੀਦੀ", "ਦਿਓ", "ਲੱਗ", "ਪਿਆ", "ਪਈ",
+        "ਨੇ", "ਕਿਵੇਂ", "ਕਿੱਥੇ", "ਕਦੋਂ", "ਕਿਉਂ", "ਰਿਹਾ", "ਰਹੀ", "ਰਹੇ", "ਸਕਦਾ",
+        "ਸਕਦੀ", "ਸਕਦੇ", "ਮੈਨੂੰ", "ਮੇਰਾ", "ਮੇਰੀ", "ਮੇਰੇ", "ਸਾਡਾ", "ਸਾਡੀ", "ਸਾਡੇ",
+        "ਤੁਸੀਂ", "ਤੁਹਾਡਾ", "ਤੁਹਾਡੀ", "ਤੁਹਾਡੇ", "ਆਪਣਾ", "ਆਪਣੀ", "ਨਾਲ", "ਵਿਚ",
+        "ਉੱਤੇ", "ਕਰਨਾ", "ਕੀਤਾ", "ਹੋਣਾ", "ਹੋਵੇ", "ਜਾਂ", "ਜਾਵੇ", "ਕਿਰਪਾ", "ਕਰਕੇ",
     }
 )
 
@@ -136,6 +144,21 @@ ROUTINE_CONTEXT_WORDS = frozenset(
         "ਦੁੱਧ", "ਰਿਮੋਟ", "ਕੱਪੜਾ",
     }
 )
+
+#: Prior domain keywords for boosting low-resource multilingual transcripts (Indic scripts).
+ROUTINE_KEYWORD_MAP: dict[str, list[str]] = {
+    "seat_issue": ["ਸੀਟ", "ਸਿਟ", "ਸੀਟਬੈਲਟ", "ਕੁਰਸੀ", "सीट", "सीटबेल्ट"],
+    "meal_inquiry": ["ਖਾਣਾ", "ਭੋਜਨ", "ਖਾਣ", "ਰੋਟੀ", "khana", "खाना", "भोजन", "लंच", "डिनर"],
+    "water_request": ["ਪਾਣੀ", "ਜਲ", "paani", "पानी", "जल"],
+    "tea_coffee": ["ਕੌਫੀ", "ਕਾਫੀ", "ਚਾਹ", "chai", "चाय", "कॉफी", "कॉफ़ी"],
+    "bag_help": ["ਸੂਟਕੇਸ", "ਅਟੈਚੀ", "ਬੈਗ", "ਸਮਾਨ", "बैग", "सूटकेस", "सामान"],
+    "blanket_request": ["ਕੰਬਲ", "kambal", "कंबल"],
+    "pillow_request": ["ਤਕੀਆ", "ਸਿਰਹਾਣਾ", "takiya", "तकिया", "सिरहाना"],
+    "lavatory_assist": ["ਵਾਸ਼ਰੂਮ", "ਟਾਇਲਟ", "ਗੁਸਲਖਾਨਾ", "वॉशरूम", "शौचालय", "टॉयलेट"],
+    "customs_form": ["ਕਸਟਮ", "ਫਾਰਮ", "ਡੈਕਲਰੇਸ਼ਨ", "ਕਾਰਡ", "फॉर्म", "कस्टम", "कार्ड"],
+    "headphone_request": ["ਹੈੱਡਫੋਨ", "ਈਅਰਫੋਨ", "हेडफोन", "इयरफोन"],
+    "baby_care": ["ਬੇਬੀ", "ਡਾਇਪਰ", "ਦੁੱਧ ਦੀ ਬੋਤਲ", "डायपर", "बेबी"],
+}
 
 #: Rule-based attribute vocabulary. Validated against ``allowed_attributes`` at
 #: contract-load time, so the catalog stays the single source of truth.
@@ -325,15 +348,56 @@ def urgent_keyword_map(contract: dict[str, Any]) -> dict[str, list[str]]:
 # --------------------------------------------------------------------------- #
 # Text helpers                                                                 #
 # --------------------------------------------------------------------------- #
+def fix_mixed_indic(text: str) -> str:
+    """Harmonize stray Devanagari characters in Gurmukhi phrases (or vice versa)."""
+    if not text:
+        return ""
+    dev_count = sum(1 for ch in text if 0x0900 <= ord(ch) <= 0x097F)
+    gur_count = sum(1 for ch in text if 0x0A00 <= ord(ch) <= 0x0A7F)
+    if gur_count > 0 and dev_count > 0:
+        if gur_count >= dev_count:
+            chars = []
+            for ch in text:
+                code = ord(ch)
+                if 0x0900 <= code <= 0x097F:
+                    target = code + 0x0100
+                    try:
+                        name = unicodedata.name(chr(target))
+                        if "GURMUKHI" in name:
+                            chars.append(chr(target))
+                            continue
+                    except ValueError:
+                        pass
+                chars.append(ch)
+            return "".join(chars)
+        else:
+            chars = []
+            for ch in text:
+                code = ord(ch)
+                if 0x0A00 <= code <= 0x0A7F:
+                    target = code - 0x0100
+                    try:
+                        name = unicodedata.name(chr(target))
+                        if "DEVANAGARI" in name:
+                            chars.append(chr(target))
+                            continue
+                    except ValueError:
+                        pass
+                chars.append(ch)
+            return "".join(chars)
+    return text
+
+
 def normalize_text(text: str | None) -> str:
     """Trim control characters/extra whitespace/repeated punctuation.
 
-    Unicode is NFC-normalised so Devanagari and Gurmukhi stay intact; no
-    transliteration, lowercasing or stop-word removal happens here.
+    Unicode is NFC-normalised so Devanagari and Gurmukhi stay intact; stray mixed
+    Indic script characters are harmonized.
     """
     if text is None:
         return ""
     value = unicodedata.normalize("NFC", str(text))
+    value = fix_mixed_indic(value)
     value = _CONTROL_CHARS_RE.sub(" ", value)
     value = _REPEATED_PUNCT_RE.sub(r"\1", value)
     value = _WHITESPACE_RE.sub(" ", value)
@@ -438,14 +502,27 @@ def _tokens(text: str) -> set[str]:
 
 
 def _phrase_present(text_lower: str, phrase: str) -> bool:
-    """Whole-word/phrase match that also tolerates apostrophes and punctuation."""
+    """Whole-word/phrase match that also tolerates apostrophes, punctuation, and nuktas."""
     if _CJK_RE.search(phrase):
         # CJK has no word boundaries; substring matching is the practical rule.
         return phrase in text_lower
-    if " " in phrase or "'" in phrase:
-        pattern = re.escape(phrase).replace(r"\ ", r"[\s,.;!?]+")
-        return re.search(rf"(?<!\w){pattern}(?!\w)", text_lower) is not None
-    return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text_lower) is not None
+
+    def _match(t: str, p: str) -> bool:
+        if " " in p or "'" in p:
+            pattern = re.escape(p).replace(r"\ ", r"[\s,.;!?]+")
+            return re.search(rf"(?<!\w){pattern}(?!\w)", t) is not None
+        return re.search(rf"(?<!\w){re.escape(p)}(?!\w)", t) is not None
+
+    if _match(text_lower, phrase):
+        return True
+
+    # Tolerate Indic nukta variations (U+093C Devanagari, U+0A3C Gurmukhi)
+    if "\u093c" in text_lower or "\u0a3c" in text_lower or "\u093c" in phrase or "\u0a3c" in phrase:
+        clean_t = text_lower.replace("\u093c", "").replace("\u0a3c", "")
+        clean_p = phrase.replace("\u093c", "").replace("\u0a3c", "")
+        return _match(clean_t, clean_p)
+
+    return False
 
 
 def request_vocabulary(contract: dict[str, Any]) -> frozenset[str]:
@@ -462,6 +539,9 @@ def request_vocabulary(contract: dict[str, Any]) -> frozenset[str]:
         chunks.extend((entry.get("labels") or {}).values())
         for chunk in chunks:
             vocabulary.update(_TOKEN_RE.findall(str(chunk).casefold()))
+    for kws in ROUTINE_KEYWORD_MAP.values():
+        for kw in kws:
+            vocabulary.update(_TOKEN_RE.findall(str(kw).casefold()))
     frozen = frozenset(vocabulary)
     _VOCAB_CACHE = (key, frozen)
     return frozen
@@ -603,6 +683,28 @@ def probability_labels(model: Any) -> list[str]:
     return [str(label) for label in getattr(model, "labels", []) or []]
 
 
+REQUIRED_MODEL_FILES = ("config.json", "config_setfit.json", "model_head.pkl")
+
+
+def _validate_model_files(model_dir: Path) -> tuple[bool, str | None]:
+    """Validate that required SetFit model assets exist and are non-empty."""
+    if not model_dir.exists() or not model_dir.is_dir():
+        return False, f"Directory does not exist: {model_dir}"
+    for req in REQUIRED_MODEL_FILES:
+        target = model_dir / req
+        if not target.exists():
+            return False, f"Missing required model file: {req}"
+        if target.stat().st_size == 0:
+            return False, f"Corrupted empty model file: {req}"
+    has_weights = (model_dir / "model.safetensors").exists() or (model_dir / "pytorch_model.bin").exists()
+    if not has_weights:
+        return False, "Missing model weights (neither model.safetensors nor pytorch_model.bin found)"
+    weights_path = (model_dir / "model.safetensors") if (model_dir / "model.safetensors").exists() else (model_dir / "pytorch_model.bin")
+    if weights_path.stat().st_size == 0:
+        return False, f"Corrupted empty model weights file: {weights_path.name}"
+    return True, None
+
+
 def init_classifier(force: bool = False) -> bool:
     """Load the fine-tuned SetFit model once. Returns True when usable."""
     with _STATE_LOCK:
@@ -626,6 +728,12 @@ def init_classifier(force: bool = False) -> bool:
         for model_dir, is_fallback in candidate_dirs:
             if not model_dir.exists():
                 logger.warning("Classifier directory not found: %s", model_dir)
+                continue
+
+            valid, validation_err = _validate_model_files(model_dir)
+            if not valid:
+                logger.warning("Classifier validation failed for %s: %s", model_dir, validation_err)
+                last_exc = ValueError(validation_err)
                 continue
 
             if is_fallback:
@@ -806,8 +914,11 @@ def _merge_urgent_candidates(
     ranked: list[tuple[str, float]],
     flagged: Iterable[str],
     limit: int = 3,
+    strong_urgent_ids: Iterable[str] = (),
 ) -> list[tuple[str, float]]:
-    """Top ``limit`` intents, guaranteeing every flagged urgent intent is present."""
+    """Top ``limit`` intents, guaranteeing every flagged urgent intent is present.
+    Strong urgent intents with verified cues are prioritized to the top.
+    """
     selected = list(ranked[:limit])
     selected_ids = {intent_id for intent_id, _ in selected}
     for intent_id in flagged:
@@ -828,6 +939,16 @@ def _merge_urgent_candidates(
         selected.append(replacement)
         selected_ids.add(intent_id)
     selected.sort(key=lambda item: item[1], reverse=True)
+
+    strong_set = set(strong_urgent_ids)
+    if strong_set:
+        for idx, (intent_id, score) in enumerate(selected):
+            if intent_id in strong_set:
+                if idx != 0:
+                    item = selected.pop(idx)
+                    selected.insert(0, item)
+                break
+
     return selected[:limit]
 
 
@@ -861,12 +982,39 @@ def classify_text(transcript: str, *, asr: dict[str, Any] | None = None) -> dict
     asr_uncertain = asr_transcript_uncertain(asr)
 
     scores = _model_probabilities(matched)
+    signals = urgent_signals(matched, contract)
+    matched_lower = matched.casefold()
+
+    # 1. Prioritize strong urgent cues (safety, medical, sickness, accessibility)
+    strong_signals = [s for s in signals if s.get("strength") == "strong"]
+    for s in strong_signals:
+        intent_id = s["intent_id"]
+        if intent_id in scores:
+            scores[intent_id] = max(scores[intent_id], 0.95)
+
+    # 2. Routine domain keyword prior boosting with baby care disambiguation
+    has_medical_signal = any(s["intent_id"] == "medical_help" for s in signals)
+    for intent_id, kws in ROUTINE_KEYWORD_MAP.items():
+        if intent_id == "baby_care":
+            # Don't boost baby_care when a medical condition or water request is present
+            if has_medical_signal or any(
+                w in matched_lower
+                for w in ["ਬੁਖਾਰ", "ਦਰਦ", "ਉਲਟੀ", "ਦਵਾਈ", "चोट", "दर्द", "बुखार", "उल्टी", "दवा", "fever", "pain", "sick"]
+            ):
+                continue
+            if "water_request" in scores and any(w in matched_lower for w in ["ਪਾਣੀ", "पानी", "water", "paani"]):
+                continue
+        for kw in kws:
+            if _phrase_present(matched_lower, kw.casefold()):
+                if intent_id in scores:
+                    scores[intent_id] = min(0.98, scores[intent_id] + 0.40)
+                break
+
     ranked = _rank(scores)
     top1_id, top1_score = ranked[0]
     top2_score = ranked[1][1] if len(ranked) > 1 else 0.0
     margin = top1_score - top2_score
 
-    signals = urgent_signals(matched, contract)
     in_vocabulary = vocabulary_coverage(matched, contract) >= min_vocab_coverage()
     # In-vocabulary text only needs a moderate urgent score to be surfaced; text
     # built from unseen words needs a decisive one, so noise is not reported as an
@@ -915,7 +1063,12 @@ def classify_text(transcript: str, *, asr: dict[str, Any] | None = None) -> dict
             "requires_choice": True,
         }
 
-    candidates = _merge_urgent_candidates(ranked, flagged, limit=3)
+    candidates = _merge_urgent_candidates(
+        ranked,
+        flagged,
+        limit=3,
+        strong_urgent_ids=[s["intent_id"] for s in strong_signals],
+    )
     candidates_payload = [
         {"intent_id": intent_id, "score": round(float(score), 4)}
         for intent_id, score in candidates

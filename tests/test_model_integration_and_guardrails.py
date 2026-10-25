@@ -168,3 +168,44 @@ def test_app_health_endpoint_returns_classifier_info():
         assert clf["framework"] == "SetFit"
         assert clf["labels"] == 15
         assert "Updated_Model" in (clf["model_dir"] or "")
+
+
+def test_model_file_validation(tmp_path):
+    # Empty directory fails validation
+    empty_dir = tmp_path / "empty_model"
+    empty_dir.mkdir()
+    valid, err = classifier._validate_model_files(empty_dir)
+    assert not valid
+    assert "Missing required model file" in err
+
+    # Directory with 0-byte file fails validation
+    (empty_dir / "config.json").write_text("")
+    (empty_dir / "config_setfit.json").write_text("{}")
+    (empty_dir / "model_head.pkl").write_bytes(b"data")
+    (empty_dir / "model.safetensors").write_bytes(b"weights")
+    valid, err = classifier._validate_model_files(empty_dir)
+    assert not valid
+    assert "Corrupted empty model file" in err
+
+
+def test_fix_mixed_indic():
+    # Stray Devanagari characters in Gurmukhi phrase are mapped to Gurmukhi
+    mixed_gurmukhi = "ਮੈਨੂੰ ਵ੍ਹੀਲਚੇਅਰ ਚਾਹੀਦਾ ਹੈ"
+    # Even if Devanagari virama or characters leak into Gurmukhi:
+    leaked = "ਮੈਨੂੰ ਵ\u094dਹੀलਚੇਅਰ ਚਾਹੀਦਾ ਹੈ"
+    harmonized = classifier.fix_mixed_indic(leaked)
+    assert "ल" not in harmonized
+    assert "ਲ" in harmonized or "ਚੇਅਰ" in harmonized
+
+
+def test_multilingual_indic_prior_routing():
+    # Punjabi Gurmukhi water request
+    res_water = classifier.classify_text("ਕਿਰਪਾ ਕਰਕੇ ਮੈਨੂੰ ਪਾਣੀ ਦਿਓ")
+    assert res_water["outcome"] in ("SUGGESTED", "REQUIRES_CHOICE")
+    top_intent = res_water["candidates"][0]["intent_id"]
+    assert top_intent == "water_request"
+
+    # Child fever prioritizes medical_help over baby_care
+    res_fever = classifier.classify_text("ਬੱਚੇ ਨੂੰ ਤੇਜ਼ ਬੁਖਾਰ ਹੈ ਕਿਰਪਾ ਕਰਕੇ ਮਦਦ ਕਰੋ")
+    top_fever = res_fever["candidates"][0]["intent_id"]
+    assert top_fever == "medical_help"

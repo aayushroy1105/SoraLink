@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request
 from flask_socketio import SocketIO, emit, join_room
 
 import auth as auth_service
@@ -70,6 +70,16 @@ def create_app(config_name=None):
         })
 
     @app.get("/")
+    def page_root():
+        host = request.host or ""
+        crew_port = str(app.config.get("CREW_PORT", 5002))
+        passenger_port = str(app.config.get("PORT", 5001))
+        if host.endswith(f":{crew_port}"):
+            return redirect("/crew")
+        if host.endswith(f":{passenger_port}"):
+            return redirect("/passenger")
+        return render_template("login.html")
+
     @app.get("/login")
     def page_login():
         return render_template("login.html")
@@ -1072,11 +1082,47 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    socketio.run(
-        app,
-        host=app.config["HOST"],
-        port=app.config["PORT"],
-        debug=app.config["DEBUG"],
-        allow_unsafe_werkzeug=True,
-    )
+    import threading
+
+    host = app.config["HOST"]
+    passenger_port = app.config["PORT"]
+    crew_port = app.config.get("CREW_PORT", 5002)
+    dual_port = app.config.get("DUAL_PORT", True)
+    debug = app.config["DEBUG"]
+
+    if dual_port and passenger_port != crew_port:
+        print(f" * SoraLink starting in dual-portal mode on {host}:")
+        print(f" *   -> Passenger Portal: http://{host}:{passenger_port}/ (or http://localhost:{passenger_port}/)")
+        print(f" *   -> Crew Portal:      http://{host}:{crew_port}/ (or http://localhost:{crew_port}/)")
+
+        # Run crew portal in background thread sharing in-memory socketio and app
+        crew_thread = threading.Thread(
+            target=socketio.run,
+            args=(app,),
+            kwargs={
+                "host": host,
+                "port": crew_port,
+                "debug": False,
+                "allow_unsafe_werkzeug": True,
+            },
+            daemon=True,
+        )
+        crew_thread.start()
+
+        # Run passenger portal on main thread
+        socketio.run(
+            app,
+            host=host,
+            port=passenger_port,
+            debug=debug,
+            allow_unsafe_werkzeug=True,
+        )
+    else:
+        socketio.run(
+            app,
+            host=host,
+            port=passenger_port,
+            debug=debug,
+            allow_unsafe_werkzeug=True,
+        )
 

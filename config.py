@@ -56,7 +56,9 @@ class Config:
 
     # Local/offline server defaults.
     HOST = os.environ.get("SORALINK_HOST", "0.0.0.0")
-    PORT = int(os.environ.get("SORALINK_PORT", "5000"))
+    PORT = int(os.environ.get("SORALINK_PORT", "5001"))
+    CREW_PORT = int(os.environ.get("SORALINK_CREW_PORT", "5002"))
+    DUAL_PORT = _env_bool("SORALINK_DUAL_PORT", True)
 
     # Voice processing limits; actual processing is implemented separately.
     MAX_CONTENT_LENGTH = int(

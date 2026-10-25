@@ -15,6 +15,8 @@ Public interface used by ``voice.py`` and the backend:
 
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import re
@@ -25,7 +27,10 @@ from typing import Any, Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INTENTS_PATH = PROJECT_ROOT / "data" / "intents.json"
-DEFAULT_CLASSIFIER_DIR = PROJECT_ROOT / "models" / "setfit_intent_classifier"
+UPDATED_MODEL_DIR = PROJECT_ROOT / "Updated_Model" / "models" / "setfit_intent_classifier"
+FALLBACK_MODEL_DIR = PROJECT_ROOT / "models" / "setfit_intent_classifier"
+DEFAULT_CLASSIFIER_DIR = UPDATED_MODEL_DIR
+logger = logging.getLogger(__name__)
 
 REQUIRED_INTENT_IDS: tuple[str, ...] = (
     "medical_help",
@@ -48,7 +53,7 @@ URGENT_IDS: frozenset[str] = frozenset(REQUIRED_INTENT_IDS[:4])
 VALID_PRIORITIES = frozenset({"URGENT", "ROUTINE"})
 
 #: Thresholds (overridable through the environment / ``.env``).
-DEFAULT_SUGGESTED_THRESHOLD = 0.50  # calibrated by scripts/train_classifier.py
+DEFAULT_SUGGESTED_THRESHOLD = 0.60  # calibrated by scripts/train_classifier.py
 DEFAULT_MARGIN_THRESHOLD = 0.05
 DEFAULT_UNRELIABLE_THRESHOLD = 0.35
 #: An URGENT intent at or above this score is never dropped from the preview.
@@ -64,6 +69,11 @@ OOD_URGENT_SCORE_THRESHOLD = 0.50
 #: rather than a confident guess.
 DEFAULT_MIN_VOCAB_COVERAGE = 0.34
 
+#: Whisper -> classifier hand-off. A transcript the ASR itself doubts must never
+#: become an auto-accepted suggestion; it is downgraded to REQUIRES_CHOICE.
+ASR_MIN_AVG_LOGPROB = -1.0
+ASR_MAX_NO_SPEECH_PROB = 0.6
+
 #: Function words carry no intent and are ignored by the coverage check.
 _STOPWORDS = frozenset(
     {
@@ -78,13 +88,25 @@ _STOPWORDS = frozenset(
         "hai", "hoon", "hu", "ho", "ka", "ki", "ke", "ko", "se", "me", "mein", "hai",
         "kya", "koi", "ek", "de", "do", "di", "ji", "mera", "meri", "mujhe", "mujh",
         "thoda", "zara", "karo", "kar", "karne", "mil", "sakta", "sakti",
+        # Devanagari function words (grammar only; content nouns stay content).
+        "है", "हैं", "हूँ", "हूं", "हो", "था", "थी", "थे", "में", "को", "से", "ने",
+        "का", "की", "के", "और", "कि", "भी", "नहीं", "क्या", "यह", "वह", "ये", "वो",
+        "इस", "उस", "एक", "कुछ", "बहुत", "थोड़ा", "थोड़ी", "कृपया", "जी", "लिए",
+        "वाला", "वाली", "वाले", "गया", "गई", "हुआ", "हुई", "होने", "कर", "करने",
+        "चाहिए", "चाहता", "चाहती", "दीजिए", "कीजिए", "बताइए", "पड़ा", "पड़ी",
+        # Gurmukhi function words.
+        "ਹੈ", "ਹਨ", "ਸੀ", "ਵਿੱਚ", "ਨੂੰ", "ਦਾ", "ਦੀ", "ਦੇ", "ਤੋਂ", "ਤੇ", "ਲਈ",
+        "ਵਾਲਾ", "ਵਾਲੀ", "ਵਾਲੇ", "ਕਿ", "ਵੀ", "ਨਹੀਂ", "ਕੀ", "ਇਹ", "ਉਹ", "ਇੱਕ",
+        "ਕੁਝ", "ਬਹੁਤ", "ਥੋੜ੍ਹਾ", "ਗਿਆ", "ਗਈ", "ਕਰੋ", "ਕਰ", "ਕਰਨ", "ਚਾਹੀਦਾ",
+        "ਚਾਹੀਦੀ", "ਦਿਓ", "ਲੱਗ", "ਪਿਆ", "ਪਈ",
     }
 )
 
 _VOCAB_CACHE: tuple[int, frozenset[str]] | None = None
+_CJK_VOCAB_CACHE: tuple[int, frozenset[str]] | None = None
 
 #: Words that only mean "urgent" together with the absence of routine context.
-WEAK_URGENT_CUES = frozenset({"help", "madad", "urgent", "urgently"})
+WEAK_URGENT_CUES = frozenset({"help", "madad", "मदद", "ਮਦਦ", "urgent", "urgently"})
 
 #: Nouns that mark a request as routine. Used only to qualify weak urgent cues,
 #: so "help me with my bag" stays routine while "help me please" surfaces help.
@@ -104,6 +126,14 @@ ROUTINE_CONTEXT_WORDS = frozenset(
         "bottle", "changing", "sterilise", "sterilize",
         "customs", "immigration", "declaration", "arrival", "landing", "transit",
         "headphone", "earphone", "earphones", "remote", "volume",
+        # Devanagari routine nouns: keep "... में मदद" requests routine.
+        "बैग", "सामान", "कंबल", "तकिया", "पानी", "चाय", "कॉफ़ी", "खाना", "सीट",
+        "टॉयलेट", "वॉशरूम", "स्क्रीन", "हेडफोन", "बच्चा", "बच्चे", "बोतल", "फॉर्म",
+        "दूध", "रिमोट", "कपड़ा",
+        # Gurmukhi routine nouns.
+        "ਬੈਗ", "ਸਮਾਨ", "ਕੰਬਲ", "ਤਕੀਆ", "ਪਾਣੀ", "ਚਾਹ", "ਕੌਫੀ", "ਖਾਣਾ", "ਸੀਟ",
+        "ਟਾਇਲਟ", "ਵਾਸ਼ਰੂਮ", "ਸਕ੍ਰੀਨ", "ਹੈੱਡਫੋਨ", "ਬੱਚਾ", "ਬੱਚੇ", "ਬੋਤਲ", "ਫਾਰਮ",
+        "ਦੁੱਧ", "ਰਿਮੋਟ", "ਕੱਪੜਾ",
     }
 )
 
@@ -136,6 +166,11 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u2
 _REPEATED_PUNCT_RE = re.compile(r"([!?.,;:])\1+")
 _WHITESPACE_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"[\w\u0900-\u097F\u0A00-\u0A7F']+", re.UNICODE)
+#: Japanese/Korean-script detection. These scripts have no word spaces, so the
+#: whitespace-token coverage gate would reject every phrase; coverage for them is
+#: measured with character bigrams instead.
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+_CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]+")
 
 
 # --------------------------------------------------------------------------- #
@@ -305,12 +340,108 @@ def normalize_text(text: str | None) -> str:
     return value.strip()
 
 
+#: Whisper spells Hindi/Punjabi loanwords inconsistently ("pani" vs the catalog's
+#: "paani"). Folding the known variants onto the trained spelling makes keyword
+#: matching and the vocabulary gate survive common ASR spellings.
+_ROMANIZED_VARIANTS: dict[str, str] = {
+    "pani": "paani",
+    "panee": "paani",
+    "panni": "paani",
+    "dudh": "doodh",
+    "dood": "doodh",
+    "kambhal": "kambal",
+    "kambl": "kambal",
+    "kambaal": "kambal",
+    "takia": "takiya",
+    "takiyaa": "takiya",
+    "takiye": "takiya",
+    "khaana": "khana",
+    "khanna": "khana",
+    "chay": "chai",
+    "chae": "chai",
+    "davai": "dawa",
+    "dawai": "dawa",
+    "dava": "dawa",
+    "thandaa": "thanda",
+    "tanda": "thanda",
+    "garm": "garam",
+    "bachche": "bache",
+    "bachhe": "bache",
+    "bacha": "bache",
+    "washrom": "washroom",
+    "toilit": "toilet",
+    "blankit": "blanket",
+    "sikbag": "sick bag",
+}
+
+#: Diacritics Whisper emits for transliterated loanwords.
+_ROMAN_DIACRITICS = str.maketrans(
+    {
+        "ā": "a", "á": "a", "à": "a", "ī": "i", "í": "i", "ū": "u", "ú": "u",
+        "ē": "e", "é": "e", "ō": "o", "ó": "o", "ṇ": "n", "ñ": "n", "ṭ": "t",
+        "ḍ": "d", "ṛ": "r", "ś": "s", "ṃ": "m", "ṁ": "m",
+    }
+)
+_LATIN_WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]+")
+#: Conversational fillers Whisper puts in front of a request ("Okay, can I get...").
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:okay|ok|so|um+|uh+|hmm+|yeah|alright|well|actually)[,.!\s]+)+", re.IGNORECASE
+)
+
+
+def canonicalize_romanized(text: str | None) -> str:
+    """Fold known ASR spellings of Hinglish/Hindi/Punjabi words onto catalog spellings."""
+    if not text:
+        return ""
+
+    def merge(match: re.Match[str]) -> str:
+        token = match.group(0)
+        folded = token.casefold().translate(_ROMAN_DIACRITICS)
+        return _ROMANIZED_VARIANTS.get(folded, token)
+
+    return _LATIN_WORD_RE.sub(merge, str(text))
+
+
+def strip_asr_noise(text: str | None) -> str:
+    """Drop leading conversational fillers the ASR prepends to a real request."""
+    value = normalize_text(text)
+    previous = None
+    while previous != value:
+        previous = value
+        value = _LEADING_FILLER_RE.sub("", value).strip()
+    return value
+
+
+def asr_transcript_uncertain(asr: dict[str, Any] | None) -> bool:
+    """True when Whisper's own confidence says the transcript is shaky."""
+    if not asr:
+        return False
+    try:
+        avg = asr.get("avg_logprob")
+        if avg is not None and float(avg) < ASR_MIN_AVG_LOGPROB:
+            return True
+        no_speech = asr.get("no_speech_prob")
+        if no_speech is not None and float(no_speech) > ASR_MAX_NO_SPEECH_PROB:
+            return True
+    except (TypeError, ValueError):
+        return False
+    return False
+
+
+def matching_view(text: str | None) -> str:
+    """The text used for cues, attributes and coverage (never shown to the user)."""
+    return canonicalize_romanized(strip_asr_noise(text))
+
+
 def _tokens(text: str) -> set[str]:
     return {tok.casefold() for tok in _TOKEN_RE.findall(text)}
 
 
 def _phrase_present(text_lower: str, phrase: str) -> bool:
     """Whole-word/phrase match that also tolerates apostrophes and punctuation."""
+    if _CJK_RE.search(phrase):
+        # CJK has no word boundaries; substring matching is the practical rule.
+        return phrase in text_lower
     if " " in phrase or "'" in phrase:
         pattern = re.escape(phrase).replace(r"\ ", r"[\s,.;!?]+")
         return re.search(rf"(?<!\w){pattern}(?!\w)", text_lower) is not None
@@ -336,10 +467,55 @@ def request_vocabulary(contract: dict[str, Any]) -> frozenset[str]:
     return frozen
 
 
+def _cjk_dominant(text: str) -> bool:
+    """True when most letters in ``text`` are Japanese/CJK characters."""
+    letters = [ch for ch in text if ch.isalnum()]
+    cjk = sum(1 for ch in text if _CJK_RE.match(ch))
+    return cjk >= 2 and cjk / max(1, len(letters)) >= 0.5
+
+
+def _bigrams(value: str) -> set[str]:
+    return {value[index] + value[index + 1] for index in range(len(value) - 1)}
+
+
+def request_cjk_vocabulary(contract: dict[str, Any]) -> frozenset[str]:
+    """Character bigrams of every CJK chunk the catalog knows."""
+    global _CJK_VOCAB_CACHE
+    key = id(contract)
+    if _CJK_VOCAB_CACHE is not None and _CJK_VOCAB_CACHE[0] == key:
+        return _CJK_VOCAB_CACHE[1]
+    grams: set[str] = set()
+    for entry in contract["intents"]:
+        chunks: list[str] = [entry["intent_id"]]
+        chunks.extend(entry.get("training_examples", []))
+        chunks.extend(entry.get("urgent_keywords", []))
+        chunks.extend((entry.get("labels") or {}).values())
+        for chunk in chunks:
+            for run in _CJK_RUN_RE.findall(str(chunk)):
+                grams.update(_bigrams(run))
+    frozen = frozenset(grams)
+    _CJK_VOCAB_CACHE = (key, frozen)
+    return frozen
+
+
 def vocabulary_coverage(text: str, contract: dict[str, Any] | None = None) -> float:
-    """Fraction of content tokens that appear in the catalog vocabulary."""
+    """Fraction of content units that appear in the catalog vocabulary.
+
+    Whitespace tokens are used for Latin/Devanagari/Gurmukhi text; Japanese and
+    other CJK scripts are measured with character bigrams because they have no
+    word spaces (token-based coverage would reject every phrase).
+    """
     contract = contract or load_intent_contract()
-    tokens = [t for t in _TOKEN_RE.findall(normalize_text(text).casefold()) if len(t) > 1]
+    normalized = normalize_text(text).casefold()
+    if _cjk_dominant(normalized):
+        text_bigrams: set[str] = set()
+        for run in _CJK_RUN_RE.findall(normalized):
+            text_bigrams.update(_bigrams(run))
+        if not text_bigrams:
+            return 1.0
+        vocabulary = request_cjk_vocabulary(contract)
+        return sum(1 for gram in text_bigrams if gram in vocabulary) / len(text_bigrams)
+    tokens = [t for t in _TOKEN_RE.findall(normalized) if len(t) > 1]
     content = [t for t in tokens if t not in _STOPWORDS]
     if not content:
         return 1.0  # nothing to judge; let the model decision stand
@@ -383,6 +559,7 @@ class _ClassifierState:
     labels: list[str] = []
     device: str | None = None
     load_error: str | None = None
+    model_dir: str | None = None
 
 
 _STATE = _ClassifierState()
@@ -390,8 +567,12 @@ _STATE_LOCK = threading.Lock()
 
 
 def _classifier_dir() -> Path:
-    env_dir = os.environ.get("SORALINK_CLASSIFIER_DIR")
-    return Path(env_dir) if env_dir else DEFAULT_CLASSIFIER_DIR
+    env_dir = os.environ.get("SORALINK_MODEL_DIR") or os.environ.get("SORALINK_CLASSIFIER_DIR")
+    if env_dir:
+        return Path(env_dir)
+    if UPDATED_MODEL_DIR.exists():
+        return UPDATED_MODEL_DIR
+    return DEFAULT_CLASSIFIER_DIR
 
 
 def _detect_device() -> str:
@@ -430,44 +611,79 @@ def init_classifier(force: bool = False) -> bool:
         _STATE.model = None
         _STATE.labels = []
         _STATE.load_error = None
+        _STATE.model_dir = None
 
-        model_dir = _classifier_dir()
-        if not model_dir.exists():
-            _STATE.load_error = "classifier weights not found"
-            return False
+        env_dir = os.environ.get("SORALINK_MODEL_DIR") or os.environ.get("SORALINK_CLASSIFIER_DIR")
+        candidate_dirs: list[tuple[Path, bool]] = []
+        if env_dir:
+            candidate_dirs = [(Path(env_dir), False)]
+        else:
+            candidate_dirs = [(UPDATED_MODEL_DIR, False)]
+            if FALLBACK_MODEL_DIR.exists() and FALLBACK_MODEL_DIR != UPDATED_MODEL_DIR:
+                candidate_dirs.append((FALLBACK_MODEL_DIR, True))
 
-        try:
-            from setfit import SetFitModel
+        last_exc: Exception | None = None
+        for model_dir, is_fallback in candidate_dirs:
+            if not model_dir.exists():
+                logger.warning("Classifier directory not found: %s", model_dir)
+                continue
 
-            model = SetFitModel.from_pretrained(
-                str(model_dir),
-                local_files_only=True,
-            )
-            labels = probability_labels(model)
-            if sorted(labels) != sorted(REQUIRED_INTENT_IDS):
-                raise ValueError(
-                    "classifier labels do not match the frozen intent vocabulary "
-                    f"({len(labels)} labels)"
+            if is_fallback:
+                logger.warning(
+                    "EXPLICIT FALLBACK: Primary model at %s is unavailable. Falling back to legacy model at %s",
+                    UPDATED_MODEL_DIR,
+                    model_dir,
                 )
 
-            device = _detect_device()
-            if device != "cpu" and hasattr(model, "to"):
-                try:
-                    model.to(device)
-                except Exception:
-                    device = "cpu"
-            elif device != "cpu":
-                device = "cpu"
+            try:
+                logger.info("Loading SetFit intent classifier from %s", model_dir)
+                from setfit import SetFitModel
 
-            _STATE.model = model
-            _STATE.labels = labels
-            _STATE.device = device
-            return True
-        except Exception as exc:  # pragma: no cover - depends on local weights
-            _STATE.model = None
-            _STATE.labels = []
-            _STATE.load_error = f"{type(exc).__name__}"
-            return False
+                model = SetFitModel.from_pretrained(str(model_dir))
+                labels = probability_labels(model)
+                if sorted(labels) != sorted(REQUIRED_INTENT_IDS):
+                    raise ValueError(
+                        "classifier labels do not match the frozen intent vocabulary "
+                        f"({len(labels)} labels)"
+                    )
+
+                device = _detect_device()
+                if device != "cpu" and hasattr(model, "to"):
+                    try:
+                        model.to(device)
+                    except Exception:
+                        device = "cpu"
+                elif device != "cpu":
+                    device = "cpu"
+
+                _STATE.model = model
+                _STATE.labels = labels
+                _STATE.device = device
+                _STATE.model_dir = str(model_dir)
+                logger.info(
+                    "Loaded SetFit intent classifier from %s on device %s (fallback=%s)",
+                    model_dir,
+                    device,
+                    is_fallback,
+                )
+                return True
+            except Exception as exc:  # pragma: no cover - depends on local weights
+                last_exc = exc
+                logger.error("Failed to load classifier from %s: %s", model_dir, exc)
+
+        _STATE.model = None
+        _STATE.labels = []
+        if last_exc:
+            _STATE.load_error = f"{type(last_exc).__name__}: {last_exc}"
+        else:
+            primary_path = candidate_dirs[0][0] if candidate_dirs else "none"
+            _STATE.load_error = f"classifier directory not found at {primary_path}"
+        return False
+
+
+def get_loaded_model_dir() -> str | None:
+    """Return the filesystem path of the loaded intent classifier model, if any."""
+    return getattr(_STATE, "model_dir", None)
 
 
 def get_classifier_readiness() -> str:
@@ -615,8 +831,14 @@ def _merge_urgent_candidates(
     return selected[:limit]
 
 
-def classify_text(transcript: str) -> dict[str, Any]:
-    """Classify a transcript into the frozen vocabulary and pick a preview outcome."""
+def classify_text(transcript: str, *, asr: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Classify a transcript into the frozen vocabulary and pick a preview outcome.
+
+    ``asr`` is optional Whisper telemetry (``avg_logprob``, ``no_speech_prob``).
+    When the recogniser itself doubts the transcript, an otherwise confident
+    prediction is capped at REQUIRES_CHOICE so the passenger confirms rather
+    than the pipeline guessing on a misheard request.
+    """
     text = normalize_text(transcript)
     if not text:
         raise VoiceProcessingError(
@@ -633,14 +855,19 @@ def classify_text(transcript: str) -> dict[str, Any]:
             503,
         )
 
-    scores = _model_probabilities(text)
+    # Cues, attributes and the vocabulary gate run on the ASR-tolerant view;
+    # the returned transcript stays what the passenger actually said.
+    matched = matching_view(text) or text
+    asr_uncertain = asr_transcript_uncertain(asr)
+
+    scores = _model_probabilities(matched)
     ranked = _rank(scores)
     top1_id, top1_score = ranked[0]
     top2_score = ranked[1][1] if len(ranked) > 1 else 0.0
     margin = top1_score - top2_score
 
-    signals = urgent_signals(text, contract)
-    in_vocabulary = vocabulary_coverage(text, contract) >= min_vocab_coverage()
+    signals = urgent_signals(matched, contract)
+    in_vocabulary = vocabulary_coverage(matched, contract) >= min_vocab_coverage()
     # In-vocabulary text only needs a moderate urgent score to be surfaced; text
     # built from unseen words needs a decisive one, so noise is not reported as an
     # urgent need. A matched urgent keyword always wins either way.
@@ -668,6 +895,7 @@ def classify_text(transcript: str) -> dict[str, Any]:
         top1_score >= limits["suggested"]
         and margin >= limits["margin"]
         and not urgent_conflict
+        and not asr_uncertain  # a shaky transcript is confirmed, never auto-filed
     ):
         outcome = "SUGGESTED"
     elif top1_score < limits["unreliable"] and not urgent_conflict:
@@ -697,7 +925,7 @@ def classify_text(transcript: str) -> dict[str, Any]:
         return {
             "transcript": text,
             "suggested_intent": {"intent_id": top1_id, "score": round(float(top1_score), 4)},
-            "attributes": extract_attributes(top1_id, text, contract),
+            "attributes": extract_attributes(top1_id, matched, contract),
             "candidates": candidates_payload,
             "outcome": "SUGGESTED",
             "requires_choice": False,
@@ -718,8 +946,14 @@ __all__ = [
     "REQUIRED_INTENT_IDS",
     "URGENT_IDS",
     "VoiceProcessingError",
+    "ASR_MAX_NO_SPEECH_PROB",
+    "ASR_MIN_AVG_LOGPROB",
+    "asr_transcript_uncertain",
+    "canonicalize_romanized",
     "classify_text",
     "extract_attributes",
+    "matching_view",
+    "strip_asr_noise",
     "get_classifier_readiness",
     "init_classifier",
     "load_intent_contract",
@@ -728,6 +962,12 @@ __all__ = [
     "thresholds",
     "urgent_signals",
     "vocabulary_coverage",
+    "get_loaded_model_dir",
+    "ClassifierError",
+    "load_intent_catalog",
+    "get_confidence_threshold",
+    "classify_intent",
+    "reset_classifier",
 ]
 
 

@@ -14,7 +14,9 @@ Public interface (used by ``app.py``)::
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -25,7 +27,9 @@ from typing import Any
 import numpy as np
 
 from classifier import (
+    ASR_MAX_NO_SPEECH_PROB,
     VoiceProcessingError,
+    asr_transcript_uncertain,
     classify_text,
     get_classifier_readiness,
     init_classifier,
@@ -291,7 +295,84 @@ def _decode_samples(path: Path) -> np.ndarray:
     return samples
 
 
-def _transcribe(model: Any, samples: np.ndarray) -> tuple[str, str, float]:
+#: Domain vocabulary handed to Whisper as ``initial_prompt``. Latin tokens only:
+#: a mixed-script prompt would bias decoding of English speech.
+_ASR_HOTWORDS: str | None = None
+_ASR_HOTWORD_LOCK = threading.Lock()
+
+#: Phrases Whisper invents on silence or noise. A match is only rejected when the
+#: model's own ``no_speech_prob`` agrees there was no speech, so a genuine "thank
+#: you" stays a (non-request) transcript instead of becoming an error.
+_WHISPER_HALLUCINATION_RE = re.compile(
+    r"^(thank you( very much)?|thanks for watching.*|please subscribe.*|subtitles? by .*"
+    r"|amara\.org|you|bye( bye)?|\.+|\W+)$",
+    re.IGNORECASE,
+)
+
+
+#: Filler words that add nothing as decoding context.
+_HOTWORD_STOP = frozenset(
+    {
+        "requested", "request", "requesting", "the", "and", "for", "with", "from",
+        "this", "that", "these", "those", "ask", "asks", "asking", "passenger",
+        "passengers", "crew", "flight", "care", "available", "cabin", "needed",
+        "assist", "assistance", "inquiry", "enquiry", "issue", "problem", "concern",
+    }
+)
+
+
+def _asr_hotwords() -> str:
+    """Build (once) a compact English domain prompt for Whisper decoding.
+
+    Only English intent IDs and English labels feed the prompt. Training examples
+    are deliberately excluded: they contain romanized Hinglish, and seeding those
+    tokens biases English decoding (measured: an inserted "hai" in an English
+    recording). The prompt is a punctuation-free sentence so Whisper does not
+    start emitting list commas into transcripts.
+    """
+    global _ASR_HOTWORDS
+    if os.environ.get("SORALINK_ASR_HOTWORDS", "1").strip() == "0":
+        return ""
+    if _ASR_HOTWORDS is not None:
+        return _ASR_HOTWORDS
+    with _ASR_HOTWORD_LOCK:
+        if _ASR_HOTWORDS is not None:
+            return _ASR_HOTWORDS
+        words: list[str] = []
+        try:
+            contract = load_intent_contract()
+            seen: set[str] = set()
+            for entry in contract["intents"]:
+                candidates = str(entry["intent_id"]).replace("_", " ").split()
+                candidates += re.findall(
+                    r"[A-Za-z']+", str((entry.get("labels") or {}).get("en", "")).casefold()
+                )
+                for word in candidates:
+                    word = word.strip("'")
+                    if len(word) > 2 and word not in _HOTWORD_STOP and word not in seen:
+                        seen.add(word)
+                        words.append(word)
+        except Exception:  # a missing catalog must never break transcription
+            words = []
+        prompt = (
+            "A passenger asks the crew for " + " ".join(words[:64]) + " on the flight"
+            if words
+            else ""
+        )
+        _ASR_HOTWORDS = prompt[:800]
+        return _ASR_HOTWORDS
+
+
+def _is_silence_hallucination(transcript: str, quality: dict[str, Any]) -> bool:
+    if not transcript:
+        return False
+    candidate = transcript.strip().strip(".!?…,;: \t")
+    if candidate and not _WHISPER_HALLUCINATION_RE.match(candidate):
+        return False
+    return float(quality.get("no_speech_prob") or 0.0) >= ASR_MAX_NO_SPEECH_PROB
+
+
+def _transcribe(model: Any, samples: np.ndarray) -> tuple[str, str, float, dict[str, Any]]:
     duration = float(samples.size) / float(SAMPLE_RATE)
     if duration > MAX_AUDIO_SECONDS:
         raise VoiceProcessingError(
@@ -307,14 +388,26 @@ def _transcribe(model: Any, samples: np.ndarray) -> tuple[str, str, float]:
             422,
         )
 
-    segments, info = model.transcribe(
-        samples,
-        vad_filter=True,
-        beam_size=1,
-        condition_on_previous_text=False,
-    )
+    options: dict[str, Any] = {
+        "vad_filter": True,
+        "beam_size": 1,
+        "condition_on_previous_text": False,
+    }
+    hotwords = _asr_hotwords()
+    if hotwords:
+        options["initial_prompt"] = hotwords
+    segments, info = model.transcribe(samples, **options)
+    segments = list(segments)
     parts = [segment.text.strip() for segment in segments if getattr(segment, "text", "").strip()]
     transcript = " ".join(parts).strip()
+
+    logprobs = [float(getattr(segment, "avg_logprob", 0.0) or 0.0) for segment in segments]
+    no_speech = [float(getattr(segment, "no_speech_prob", 0.0) or 0.0) for segment in segments]
+    quality: dict[str, Any] = {
+        "avg_logprob": round(sum(logprobs) / len(logprobs), 3) if logprobs else 0.0,
+        "no_speech_prob": round(max(no_speech), 3) if no_speech else 0.0,
+        "segment_count": len(segments),
+    }
 
     info_duration = float(getattr(info, "duration", 0.0) or 0.0)
     if info_duration > MAX_AUDIO_SECONDS:
@@ -325,13 +418,13 @@ def _transcribe(model: Any, samples: np.ndarray) -> tuple[str, str, float]:
         )
 
     language = str(getattr(info, "language", "") or "en").split("-")[0].lower()
-    if not transcript:
+    if not transcript or _is_silence_hallucination(transcript, quality):
         raise VoiceProcessingError(
             "SILENCE_OR_NO_SPEECH",
             "No clear speech was detected. Please try again or tap a request card.",
             422,
         )
-    return transcript, language, max(duration, info_duration)
+    return transcript, language, max(duration, info_duration), quality
 
 
 # --------------------------------------------------------------------------- #
@@ -368,8 +461,10 @@ def process_voice_preview(audio_bytes: bytes, mime_type: str) -> dict[str, Any]:
 
         started = time.perf_counter()
         samples = _decode_samples(temp_path)
-        transcript, language, duration = _transcribe(_VOICE.model, samples)
-        classification = classify_text(transcript)
+        transcript, language, duration, asr_quality = _transcribe(_VOICE.model, samples)
+        # Co-work: the recogniser's own confidence travels with the transcript, so a
+        # misheard request is confirmed by the passenger instead of auto-suggested.
+        classification = classify_text(transcript, asr=asr_quality)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
 
         # Structured preview only — persistence and confirmation belong to the backend.
@@ -387,6 +482,9 @@ def process_voice_preview(audio_bytes: bytes, mime_type: str) -> dict[str, Any]:
             "duration_seconds": round(duration, 2),
             "processing_ms": elapsed_ms,
             "device": _VOICE.device,
+            "asr_avg_logprob": asr_quality["avg_logprob"],
+            "asr_no_speech_prob": asr_quality["no_speech_prob"],
+            "asr_uncertain": asr_transcript_uncertain(asr_quality),
         }
         _LAST_PREVIEW_META.clear()
         _LAST_PREVIEW_META.update(result_meta)
@@ -421,7 +519,6 @@ __all__ = [
 ]
 
 
-import json
 import sqlite3
 import time
 import uuid

@@ -44,9 +44,30 @@ def create_app(config_name=None):
     # Create tables and indexes if they do not already exist.
     init_db()
 
+    # Preload the local intent classifier once at application startup.
+    classifier.init_classifier()
+    loaded_dir = classifier.get_loaded_model_dir()
+    readiness = classifier.get_classifier_readiness()
+    label_count = len(getattr(classifier._STATE, "labels", []) or classifier.REQUIRED_INTENT_IDS)
+    app.logger.info(
+        "Active intent classifier: framework=SetFit path=%s labels=%d readiness=%s",
+        loaded_dir,
+        label_count,
+        readiness,
+    )
+
     @app.get("/api/health")
     def health():
-        return success({"service": "SoraLink", "status": "ok"})
+        return success({
+            "service": "SoraLink",
+            "status": "ok",
+            "classifier": {
+                "framework": "SetFit",
+                "model_dir": classifier.get_loaded_model_dir(),
+                "readiness": classifier.get_classifier_readiness(),
+                "labels": len(getattr(classifier._STATE, "labels", []) or classifier.REQUIRED_INTENT_IDS),
+            },
+        })
 
     @app.get("/")
     @app.get("/login")
@@ -61,38 +82,77 @@ def create_app(config_name=None):
     def page_crew():
         return render_template("crew.html")
 
-    def _apply_session_cookie(response, token):
-        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+    # Role-specific cookie names to prevent mutual session overwrite when both
+    # passenger and crew portals are open in the same browser.
+    _ROLE_COOKIE = {
+        "passenger": "soralink_passenger_session",
+        "crew": "soralink_crew_session",
+    }
+    _LEGACY_COOKIE = "soralink_session"
+
+    def _apply_session_cookie(response, token, role=None):
         ttl = app.config.get("SESSION_TTL_SECONDS", 8 * 3600)
         secure = app.config.get("SESSION_COOKIE_SECURE", False) or request.is_secure
-        response.set_cookie(
-            key=cookie_name,
-            value=token,
-            max_age=ttl,
-            httponly=True,
-            samesite="Lax",
-            secure=secure,
-            path="/",
-        )
+        common = dict(max_age=ttl, httponly=True, samesite="Lax", secure=secure, path="/")
+        # Set the legacy generic cookie FIRST so that test clients and browsers
+        # that read only the first Set-Cookie header see soralink_session=.
+        legacy_name = app.config.get("SESSION_COOKIE_NAME", _LEGACY_COOKIE)
+        response.set_cookie(key=legacy_name, value=token, **common)
+        # Also set role-specific cookie so passenger and crew sessions coexist
+        # when both portals are open in the same browser.
+        if role in _ROLE_COOKIE:
+            response.set_cookie(key=_ROLE_COOKIE[role], value=token, **common)
         return response
 
-    def _clear_session_cookie(response):
-        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
+    def _clear_session_cookie(response, role=None):
         secure = app.config.get("SESSION_COOKIE_SECURE", False) or request.is_secure
-        response.delete_cookie(
-            key=cookie_name,
-            path="/",
-            httponly=True,
-            samesite="Lax",
-            secure=secure,
-        )
+        common = dict(path="/", httponly=True, samesite="Lax", secure=secure)
+        # Clear legacy cookie first (so tests find soralink_session= in the header).
+        legacy_name = app.config.get("SESSION_COOKIE_NAME", _LEGACY_COOKIE)
+        response.delete_cookie(key=legacy_name, **common)
+        if role in _ROLE_COOKIE:
+            response.delete_cookie(key=_ROLE_COOKIE[role], **common)
         return response
 
-    def current_session():
-        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
-        token = request.cookies.get(cookie_name)
+    def current_session(role=None):
+        """Resolve the active session from cookies.
+
+        When *role* is supplied (e.g. 'passenger' or 'crew'), the role-specific
+        cookie is checked first so that simultaneous passenger and crew sessions
+        in the same browser do not interfere with each other.  The legacy
+        generic cookie is used as a fallback so that existing test clients that
+        only set ``soralink_session`` continue to work unchanged.
+        """
+        if not role:
+            role = request.args.get("role") or request.headers.get("X-SoraLink-Role")
+            if role not in ("passenger", "crew"):
+                role = None
+
+        token = None
+        # 1. Role-specific cookie (highest priority)
+        if role and role in _ROLE_COOKIE:
+            token = request.cookies.get(_ROLE_COOKIE[role])
+        # 2. Infer role from URL path or referrer when no explicit role hint given
+        if not token:
+            path = request.path
+            if path.startswith("/api/passenger") or path.startswith("/api/requests") or path.startswith("/api/voice_request"):
+                token = request.cookies.get(_ROLE_COOKIE["passenger"])
+            elif path.startswith("/api/crew"):
+                token = request.cookies.get(_ROLE_COOKIE["crew"])
+            elif request.referrer:
+                if "/passenger" in request.referrer:
+                    token = request.cookies.get(_ROLE_COOKIE["passenger"])
+                elif "/crew" in request.referrer:
+                    token = request.cookies.get(_ROLE_COOKIE["crew"])
+        # 3. Legacy / generic cookie fallback (keeps existing tests green)
+        if not token:
+            legacy_name = app.config.get("SESSION_COOKIE_NAME", _LEGACY_COOKIE)
+            token = request.cookies.get(legacy_name)
         if not token:
             token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+        # 4. Fallback to surviving role cookie if legacy cookie was cleared by logout of the other role
+        if not token and not role:
+            token = request.cookies.get(_ROLE_COOKIE.get("passenger", "")) or request.cookies.get(_ROLE_COOKIE.get("crew", ""))
         if not token:
             raise auth_service.AuthenticationError("Missing session cookie")
 
@@ -102,12 +162,17 @@ def create_app(config_name=None):
         return session
 
     def authenticated(role=None):
-        """Protect a route using the server-resolved session."""
+        """Protect a route using the server-resolved session.
+
+        Passes the *role* hint to ``current_session()`` so that the
+        role-specific cookie is preferred over the legacy generic cookie,
+        preventing cross-role session contamination.
+        """
         def decorator(function):
             @wraps(function)
             def wrapper(*args, **kwargs):
                 try:
-                    session = current_session()
+                    session = current_session(role)
                     if role:
                         auth_service.require_role(session, role)
                     return function(session, *args, **kwargs)
@@ -139,7 +204,7 @@ def create_app(config_name=None):
                 "seat_label": result["session"]["seat_label"],
                 "session_id": result["session"]["id"],
             }, 200)
-            return _apply_session_cookie(resp, result["token"]), status
+            return _apply_session_cookie(resp, result["token"], role="passenger"), status
         except auth_service.AuthenticationError as exc:
             return failure(str(exc), 401, "INVALID_CREDENTIALS")
 
@@ -170,13 +235,33 @@ def create_app(config_name=None):
                 "crew_id": result["session"]["id"],
                 "session_id": result["session"]["id"],
             }, 200)
-            return _apply_session_cookie(resp, result["token"]), status
+            return _apply_session_cookie(resp, result["token"], role="crew"), status
         except auth_service.AuthenticationError as exc:
             return failure(str(exc), 401, "INVALID_CREDENTIALS")
 
     @app.get("/api/auth/me")
-    @authenticated()
-    def who_am_i(session):
+    def who_am_i():
+        """Return the active session.
+
+        Accepts an optional ``?role=passenger`` or ``?role=crew`` query
+        parameter so that both tabs (passenger and crew) can independently
+        verify their own session without interfering with each other.
+        """
+        role_hint = request.args.get("role") or request.headers.get("X-SoraLink-Role") or None
+        if not role_hint and request.referrer:
+            if "/crew" in request.referrer:
+                role_hint = "crew"
+            elif "/passenger" in request.referrer:
+                role_hint = "passenger"
+        if role_hint not in ("passenger", "crew", None):
+            role_hint = None
+        try:
+            session = current_session(role_hint)
+            if role_hint and session["role"] != role_hint:
+                raise auth_service.AuthenticationError(f"No active session for role {role_hint}")
+        except auth_service.AuthenticationError as exc:
+            return failure(str(exc), 401, "UNAUTHENTICATED")
+
         data = {
             "role": session["role"],
             "session_id": session["id"],
@@ -196,11 +281,35 @@ def create_app(config_name=None):
         return success(data)
 
     @app.post("/api/auth/logout")
-    @authenticated()
-    def logout(session):
+    def logout():
+        """Revoke the current session.
+
+        Accepts an optional ``?role=passenger`` or ``?role=crew`` query
+        parameter (or JSON body ``{"role": "..."}``).  Only the matching
+        role-specific cookie (and the legacy cookie) are cleared; the other
+        role's session is left intact.
+        """
+        # Resolve role hint from query param, header, body, or Referer before looking up session.
+        body = request.get_json(silent=True) or {}
+        role_hint = (
+            request.args.get("role")
+            or request.headers.get("X-SoraLink-Role")
+            or (body.get("role") if isinstance(body, dict) else None)
+        )
+        if not role_hint and request.referrer:
+            if "/crew" in request.referrer:
+                role_hint = "crew"
+            elif "/passenger" in request.referrer:
+                role_hint = "passenger"
+        if role_hint not in ("passenger", "crew", None):
+            role_hint = None
+        try:
+            session = current_session(role_hint)
+        except auth_service.AuthenticationError as exc:
+            return failure(str(exc), 401, "UNAUTHENTICATED")
         auth_service.revoke_session(session["id"])
         resp, status = success({"logged_out": True}, 200)
-        return _clear_session_cookie(resp), status
+        return _clear_session_cookie(resp, role=session["role"]), status
 
     @app.get("/api/passenger/state")
     @authenticated("passenger")
@@ -269,7 +378,7 @@ def create_app(config_name=None):
                     "status": created["status"],
                     "updated_at": created["updated_at_ms"],
                 },
-                to=f"passenger:{session['id']}",
+                to=f"passenger:seat:{created['seat_label']}",
             )
             status_code = 201
         else:
@@ -497,7 +606,7 @@ def create_app(config_name=None):
                     "status": created["status"],
                     "updated_at": created["updated_at_ms"],
                 },
-                to=f"passenger:{session['id']}",
+                to=f"passenger:seat:{created['seat_label']}",
             )
             status_code = 201
         else:
@@ -574,7 +683,9 @@ def create_app(config_name=None):
         response_id = body.get("response_id") if isinstance(body, dict) else None
 
         try:
-            item = requests_service.acknowledge_request(session, request_id)
+            item = requests_service.acknowledge_request(
+                session, request_id, response_id=response_id
+            )
         except requests_service.RequestNotFoundError as exc:
             return failure(str(exc), 404, "NOT_FOUND")
         except requests_service.InvalidTransitionError as exc:
@@ -594,6 +705,9 @@ def create_app(config_name=None):
                 },
                 to="crew:dashboard",
             )
+            # Emit to the seat room so all connected clients for this seat
+            # (including passengers who re-logged in with a new session ID)
+            # receive real-time status updates.
             socketio.emit(
                 "request_updated",
                 {
@@ -602,21 +716,22 @@ def create_app(config_name=None):
                     "status": "ACKNOWLEDGED",
                     "updated_at": item["updated_at_ms"],
                 },
-                to=f"passenger:{item['session_id']}",
+                to=f"passenger:seat:{item['seat_label']}",
             )
             if response_id:
                 crew_responses = requests_service.load_crew_responses()
                 response_data = crew_responses.get(response_id)
                 if response_data:
+                    reply_payload = {
+                        "request_id": item["id"],
+                        "response_id": response_id,
+                        "labels": response_data.get("messages", {}),
+                        "created_at": item["updated_at_ms"],
+                    }
                     socketio.emit(
                         "crew_reply",
-                        {
-                            "request_id": item["id"],
-                            "response_id": response_id,
-                            "labels": response_data.get("messages", {}),
-                            "created_at": item["updated_at_ms"],
-                        },
-                        to=f"passenger:{item['session_id']}",
+                        reply_payload,
+                        to=f"passenger:seat:{item['seat_label']}",
                     )
 
         return success({"request": item})
@@ -653,7 +768,7 @@ def create_app(config_name=None):
                     "status": "COMPLETED",
                     "updated_at": item["updated_at_ms"],
                 },
-                to=f"passenger:{item['session_id']}",
+                to=f"passenger:seat:{item['seat_label']}",
             )
 
         return success({"request": item})
@@ -837,16 +952,34 @@ def create_app(config_name=None):
 
     @socketio.on("connect")
     def socket_connect(auth_data=None):
-        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
-        token = request.cookies.get(cookie_name)
-        if not token:
-            token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+        role_hint = request.args.get("role") or request.headers.get("X-SoraLink-Role")
+        if not role_hint and isinstance(auth_data, dict):
+            role_hint = auth_data.get("role")
+        if not role_hint and request.referrer:
+            if "/passenger" in request.referrer:
+                role_hint = "passenger"
+            elif "/crew" in request.referrer:
+                role_hint = "crew"
+        if role_hint not in ("passenger", "crew", None):
+            role_hint = None
 
+        token = None
+        if role_hint and role_hint in _ROLE_COOKIE:
+            token = request.cookies.get(_ROLE_COOKIE[role_hint])
         if not token and isinstance(auth_data, dict):
             token = auth_data.get("token")
+        if not token:
+            cookie_name = app.config.get("SESSION_COOKIE_NAME", _LEGACY_COOKIE)
+            token = request.cookies.get(cookie_name)
+        if not token:
+            token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+        if not token:
+            token = request.cookies.get(_ROLE_COOKIE.get("passenger", "")) or request.cookies.get(_ROLE_COOKIE.get("crew", ""))
 
         session = auth_service.get_session_by_token(token or "") if token else None
         if session is None:
+            return False
+        if role_hint and session["role"] != role_hint:
             return False
 
         if session["role"] == "crew":
@@ -854,6 +987,11 @@ def create_app(config_name=None):
         elif session["role"] == "passenger":
             join_room(f"passenger:{session['id']}")
             join_room("passengers:all")
+            # Join the seat room so events reach the passenger even after a
+            # session rotation (re-login generates a new session ID but the
+            # seat label stays constant for the duration of the flight).
+            if session.get("seat_label"):
+                join_room(f"passenger:seat:{session['seat_label']}")
 
         payload = {
             "session_id": session["id"],
@@ -877,13 +1015,35 @@ def create_app(config_name=None):
             emit("state_resync_required", {"reason": "reconnect_or_state_mismatch"})
 
     @socketio.on("request_resync")
-    def handle_request_resync(_data=None):
-        cookie_name = app.config.get("SESSION_COOKIE_NAME", "soralink_session")
-        token = request.cookies.get(cookie_name)
+    def handle_request_resync(data=None):
+        role_hint = None
+        if isinstance(data, dict):
+            role_hint = data.get("role")
+        if not role_hint:
+            role_hint = request.args.get("role") or request.headers.get("X-SoraLink-Role")
+        if not role_hint and request.referrer:
+            if "/passenger" in request.referrer:
+                role_hint = "passenger"
+            elif "/crew" in request.referrer:
+                role_hint = "crew"
+        if role_hint not in ("passenger", "crew", None):
+            role_hint = None
+
+        token = None
+        if role_hint and role_hint in _ROLE_COOKIE:
+            token = request.cookies.get(_ROLE_COOKIE[role_hint])
         if not token:
-            token = request.cookies.get("soralink_session") or request.cookies.get("session_token")
+            token = (
+                request.cookies.get(app.config.get("SESSION_COOKIE_NAME", _LEGACY_COOKIE))
+                or request.cookies.get("soralink_session")
+                or request.cookies.get("session_token")
+                or request.cookies.get(_ROLE_COOKIE.get("passenger", ""))
+                or request.cookies.get(_ROLE_COOKIE.get("crew", ""))
+            )
         session = auth_service.get_session_by_token(token or "") if token else None
         if session is None:
+            return False
+        if role_hint and session["role"] != role_hint:
             return False
         emit("state_resync_required", {"reason": "reconnect_or_state_mismatch"})
 

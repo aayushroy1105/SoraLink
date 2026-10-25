@@ -12,6 +12,7 @@ import math
 import sys
 import types
 import wave
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
@@ -111,7 +112,8 @@ def fake_whisper(monkeypatch):
     original_device = voice._VOICE.device
 
     def install(text: str = "Could I have warm water please", language: str = "en",
-                duration: float = 1.2, raises: Exception | None = None):
+                duration: float = 1.2, raises: Exception | None = None,
+                avg_logprob: float = -0.2, no_speech_prob: float = 0.05):
         class FakeWhisper:
             def __init__(self) -> None:
                 self.kwargs: dict | None = None
@@ -121,7 +123,12 @@ def fake_whisper(monkeypatch):
                 if raises is not None:
                     raise raises
                 info = types.SimpleNamespace(duration=duration, language=language)
-                segments = [types.SimpleNamespace(text=text)] if text else []
+                segments = (
+                    [types.SimpleNamespace(text=text, avg_logprob=avg_logprob,
+                                           no_speech_prob=no_speech_prob)]
+                    if text
+                    else []
+                )
                 return iter(segments), info
 
         instance = FakeWhisper()
@@ -191,6 +198,57 @@ def test_contract_rejects_duplicate_and_bad_priority(tmp_path):
     bad_path.write_text(json.dumps(bad_priority), encoding="utf-8")
     with pytest.raises(ValueError, match="priority"):
         classifier.load_intent_contract(bad_path)
+
+
+def test_held_out_suite_integrity():
+    suite = json.loads((PROJECT_ROOT / "data" / "test_suite.json").read_text(encoding="utf-8"))
+    cases = suite["cases"]
+    assert len(cases) == 6450
+
+    ids = [case["id"] for case in cases]
+    texts = [case["text"].strip().casefold() for case in cases]
+    assert len(set(ids)) == len(ids)
+    assert len(set(texts)) == len(texts)
+
+    intent_cases = [case for case in cases if case["kind"] == "intent"]
+    failure_cases = [case for case in cases if case["kind"] == "failure"]
+    assert len(intent_cases) == 4450
+    assert len(failure_cases) == 2000
+    # Negatives must stay a substantial share of the suite (currently 45%).
+    assert len(failure_cases) / len(cases) > 0.3
+    assert {case.get("source") for case in cases} == {"curated", "generated"}
+
+    counts = Counter(case["intent"] for case in intent_cases)
+    assert set(counts) == set(REQUIRED_INTENT_IDS)
+    curated_counts = Counter(
+        case["intent"] for case in intent_cases if case["source"] == "curated"
+    )
+    assert all(count == 60 for count in curated_counts.values())
+    generated_counts = Counter(
+        case["intent"] for case in intent_cases if case["source"] == "generated"
+    )
+    assert sum(generated_counts.values()) == 3550
+    assert all(count in {236, 237} for count in generated_counts.values())
+    assert {case["register"] for case in intent_cases} == {
+        "en", "asr", "hinglish", "hi", "pa", "ja", "edge"
+    }
+    assert {case["category"] for case in failure_cases} == {
+        "gibberish", "wrong_script", "symbols", "out_of_domain", "degenerate", "statement"
+    }
+    assert sum(1 for case in failure_cases if case["source"] == "curated") == 50
+    assert sum(1 for case in failure_cases if case["source"] == "generated") == 1950
+
+
+def test_held_out_suite_never_overlaps_training_data():
+    suite = json.loads((PROJECT_ROOT / "data" / "test_suite.json").read_text(encoding="utf-8"))
+    contract = classifier.load_intent_contract(refresh=True)
+    training = {
+        example.strip().casefold()
+        for entry in contract["intents"]
+        for example in entry["training_examples"]
+    }
+    suite_texts = {case["text"].strip().casefold() for case in suite["cases"]}
+    assert not (training & suite_texts)
 
 
 def test_probability_columns_follow_head_class_order():
@@ -532,3 +590,100 @@ def test_meal_dietary_extraction(text, expected):
 )
 def test_intents_without_attributes_never_return_any(intent_id):
     assert classifier.extract_attributes(intent_id, "cold non veg warm veg snack") == {}
+
+
+# --------------------------------------------------------------------------- #
+# Whisper -> classifier hand-off                                               #
+# --------------------------------------------------------------------------- #
+def test_whisper_hotwords_are_domain_words_in_latin_script():
+    prompt = voice._asr_hotwords()
+    assert prompt
+    assert "blanket" in prompt and "water" in prompt
+    assert all(ord(char) < 128 for char in prompt), "mixed scripts bias English decoding"
+    assert voice._asr_hotwords() == prompt  # built once, then cached
+
+
+def test_transcription_sends_hotwords_and_reports_confidence(fake_whisper, fake_classifier):
+    fake_classifier({"water_request": 0.9, "blanket_request": 0.02})
+    instance = fake_whisper("Could I have warm water please")
+
+    result = voice.process_voice_preview(make_wav(1.0), "audio/wav")
+
+    assert instance.kwargs["initial_prompt"]
+    assert instance.kwargs["condition_on_previous_text"] is False
+    assert result["outcome"] == "SUGGESTED"
+    meta = voice._LAST_PREVIEW_META
+    assert meta["asr_uncertain"] is False
+    assert meta["asr_avg_logprob"] == pytest.approx(-0.2)
+    assert meta["asr_no_speech_prob"] == pytest.approx(0.05)
+
+
+def test_low_confidence_transcript_is_confirmed_never_auto_filed(fake_whisper, fake_classifier):
+    fake_classifier({"water_request": 0.9, "blanket_request": 0.02})
+    fake_whisper("Could I have warm water please", avg_logprob=-1.6)
+
+    result = voice.process_voice_preview(make_wav(1.0), "audio/wav")
+
+    assert result["outcome"] == "REQUIRES_CHOICE"
+    assert result["suggested_intent"] is None
+    assert result["requires_choice"] is True
+    assert result["candidates"], "the passenger still sees what the model heard"
+    assert voice._LAST_PREVIEW_META["asr_uncertain"] is True
+
+
+def test_noisy_clip_is_confirmed_even_when_the_head_is_confident(fake_whisper, fake_classifier):
+    fake_classifier({"water_request": 0.95})
+    fake_whisper("Could I have warm water please", no_speech_prob=0.8)
+
+    result = voice.process_voice_preview(make_wav(1.0), "audio/wav")
+
+    assert result["outcome"] == "REQUIRES_CHOICE"
+    assert result["suggested_intent"] is None
+
+
+def test_silence_hallucination_is_reported_as_no_speech(fake_whisper, fake_classifier):
+    fake_classifier({"water_request": 0.9})
+    fake_whisper("Thank you.", no_speech_prob=0.92)
+
+    with pytest.raises(VoiceProcessingError) as exc:
+        voice.process_voice_preview(make_wav(1.0), "audio/wav")
+
+    assert_error(exc, "SILENCE_OR_NO_SPEECH", 422)
+
+
+def test_a_genuine_thank_you_is_not_mistaken_for_silence(fake_whisper, fake_classifier):
+    fake_classifier({"water_request": 0.1})
+    fake_whisper("Thank you.", no_speech_prob=0.05)
+
+    result = voice.process_voice_preview(make_wav(1.0), "audio/wav")
+
+    assert result["outcome"] == "UNRELIABLE"
+    assert result["transcript"] == "Thank you."
+
+
+def test_romanized_asr_spellings_fold_onto_catalog_spellings():
+    assert classifier.canonicalize_romanized("mujhe pani chahiye") == "mujhe paani chahiye"
+    assert classifier.canonicalize_romanized("kambhal milega") == "kambal milega"
+    assert classifier.canonicalize_romanized("takia") == "takiya"
+    assert classifier.canonicalize_romanized("ठंडा पानी") == "ठंडा पानी", "non-Latin text is untouched"
+    assert classifier.strip_asr_noise("Okay, can I get water") == "can I get water"
+    assert classifier.matching_view("Um, mujhe pani chahiye") == "mujhe paani chahiye"
+
+
+def test_asr_variant_word_clears_the_vocabulary_gate(fake_classifier):
+    contract = classifier.load_intent_contract(refresh=True)
+    assert classifier.vocabulary_coverage("mujhe pani chahiye", contract) >= classifier.min_vocab_coverage()
+    assert classifier.vocabulary_coverage("qwx zpt rrv", contract) < classifier.min_vocab_coverage()
+
+    fake_classifier({"water_request": 0.9, "blanket_request": 0.02})
+    assert classifier.classify_text("pani")["outcome"] == "SUGGESTED"
+    assert classifier.classify_text("qwx")["outcome"] == "UNRELIABLE"
+
+
+def test_asr_uncertainty_helper_reads_whisper_telemetry():
+    assert classifier.asr_transcript_uncertain(None) is False
+    assert classifier.asr_transcript_uncertain({}) is False
+    assert classifier.asr_transcript_uncertain({"avg_logprob": -0.2, "no_speech_prob": 0.05}) is False
+    assert classifier.asr_transcript_uncertain({"avg_logprob": -1.4, "no_speech_prob": 0.05}) is True
+    assert classifier.asr_transcript_uncertain({"avg_logprob": -0.2, "no_speech_prob": 0.75}) is True
+    assert classifier.asr_transcript_uncertain({"avg_logprob": "n/a"}) is False

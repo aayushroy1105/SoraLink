@@ -177,6 +177,29 @@ def _request_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
 
+    # Attach any stored crew reply fields so GET /api/passenger/state returns
+    # them after a page reload or session rotation (not just via Socket.IO).
+    ack_json = item.pop("ack_details_json", None)
+    if ack_json:
+        try:
+            ack_details = json.loads(ack_json) if isinstance(ack_json, str) else ack_json
+            item["crew_reply_id"] = ack_details.get("response_id")
+            labels = ack_details.get("labels", {})
+            item["crew_reply_text_en"] = labels.get("en")
+            item["crew_reply_text_ja"] = labels.get("ja")
+            item["crew_reply"] = {
+                "response_id": ack_details.get("response_id"),
+                "labels": labels,
+            }
+        except Exception:
+            pass
+
+    for field in ("crew_reply_id", "crew_reply_text_en", "crew_reply_text_ja"):
+        if field not in item:
+            item[field] = None
+    if "crew_reply" not in item:
+        item["crew_reply"] = None
+
     return item
 
 
@@ -348,18 +371,25 @@ def list_crew_requests(
     if include_completed:
         status_filter = ""
     else:
-        status_filter = "WHERE status IN ('PENDING', 'ACKNOWLEDGED')"
+        status_filter = "WHERE r.status IN ('PENDING', 'ACKNOWLEDGED')"
 
     with get_db() as connection:
         rows = connection.execute(
             f"""
-            SELECT *
-            FROM requests
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
             {status_filter}
             ORDER BY
-                CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,
-                created_at_ms ASC,
-                id ASC
+                CASE r.priority WHEN 'urgent' THEN 0 ELSE 1 END,
+                r.created_at_ms ASC,
+                r.id ASC
             """
         ).fetchall()
 
@@ -369,18 +399,31 @@ def list_crew_requests(
 def list_passenger_requests(
     passenger_session: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Return requests belonging only to the authenticated passenger session."""
-    session_id, seat_label = _require_passenger(passenger_session)
+    """Return all requests for the authenticated passenger's seat.
+
+    Queries by ``seat_label`` only (not ``session_id``) so that requests
+    created during a previous session are visible after a re-login.  This
+    also means a passenger whose session was rotated by a page reload still
+    sees the full request history for their seat.
+    """
+    _session_id, seat_label = _require_passenger(passenger_session)
 
     with get_db() as connection:
         rows = connection.execute(
             """
-            SELECT *
-            FROM requests
-            WHERE session_id = ? AND seat_label = ?
-            ORDER BY created_at_ms DESC, id DESC
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
+            WHERE r.seat_label = ?
+            ORDER BY r.created_at_ms DESC, r.id DESC
             """,
-            (session_id, seat_label),
+            (seat_label,),
         ).fetchall()
 
     return [_request_from_row(row) for row in rows]
@@ -401,6 +444,7 @@ def _get_request(connection: sqlite3.Connection, request_id: str):
 def acknowledge_request(
     crew_session: dict[str, Any],
     request_id: str,
+    response_id: str | None = None,
 ) -> dict[str, Any]:
     """Move a pending request to acknowledged. Repeated calls are handled idempotently."""
     crew_id = _require_crew(crew_session)
@@ -411,7 +455,22 @@ def acknowledge_request(
             request = _get_request(connection, request_id)
 
             if request["status"] == "ACKNOWLEDGED":
-                result = _request_from_row(request)
+                row = connection.execute(
+                    """
+                    SELECT r.*,
+                           (
+                               SELECT details_json
+                               FROM request_events
+                               WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                               ORDER BY id DESC
+                               LIMIT 1
+                           ) AS ack_details_json
+                    FROM requests r
+                    WHERE r.id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                result = _request_from_row(row)
                 result["was_updated"] = False
                 return result
 
@@ -432,19 +491,38 @@ def acknowledge_request(
                 (timestamp, timestamp, crew_id, request_id),
             )
 
+            details: dict[str, Any] = {}
+            if response_id:
+                crew_responses = load_crew_responses()
+                resp_info = crew_responses.get(response_id)
+                details["response_id"] = response_id
+                if resp_info:
+                    details["labels"] = resp_info.get("messages", {})
+
             connection.execute(
                 """
                 INSERT INTO request_events (
                     request_id, actor_session_id, event_type,
                     details_json, created_at_ms
                 )
-                VALUES (?, ?, 'ACKNOWLEDGED', '{}', ?)
+                VALUES (?, ?, 'ACKNOWLEDGED', ?, ?)
                 """,
-                (request_id, crew_id, timestamp),
+                (request_id, crew_id, json.dumps(details), timestamp),
             )
 
         row = connection.execute(
-            "SELECT * FROM requests WHERE id = ?",
+            """
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
+            WHERE r.id = ?
+            """,
             (request_id,),
         ).fetchone()
 
@@ -503,7 +581,18 @@ def complete_request(
             )
 
         row = connection.execute(
-            "SELECT * FROM requests WHERE id = ?",
+            """
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
+            WHERE r.id = ?
+            """,
             (request_id,),
         ).fetchone()
 
@@ -529,13 +618,16 @@ def request_follow_up(
 
     with get_db() as connection:
         with transaction(connection):
+            # Look up request by ID and seat_label — we intentionally do NOT
+            # filter by session_id here because a passenger may have re-logged
+            # in (new session ID) but still owns requests for their seat.
             request = connection.execute(
                 """
                 SELECT *
                 FROM requests
-                WHERE id = ? AND session_id = ? AND seat_label = ?
+                WHERE id = ? AND seat_label = ?
                 """,
-                (request_id, session_id, seat_label),
+                (request_id, seat_label),
             ).fetchone()
 
             if request is None:
@@ -563,7 +655,18 @@ def request_follow_up(
             )
 
         row = connection.execute(
-            "SELECT * FROM requests WHERE id = ?",
+            """
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
+            WHERE r.id = ?
+            """,
             (request_id,),
         ).fetchone()
 
@@ -598,7 +701,18 @@ def get_request_by_id(request_id: str) -> dict[str, Any] | None:
     """Retrieve a request by its primary key ID, or None if not found."""
     with get_db() as connection:
         row = connection.execute(
-            "SELECT * FROM requests WHERE id = ?",
+            """
+            SELECT r.*,
+                   (
+                       SELECT details_json
+                       FROM request_events
+                       WHERE request_id = r.id AND event_type = 'ACKNOWLEDGED'
+                       ORDER BY id DESC
+                       LIMIT 1
+                   ) AS ack_details_json
+            FROM requests r
+            WHERE r.id = ?
+            """,
             (request_id,),
         ).fetchone()
 

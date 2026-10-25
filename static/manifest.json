@@ -1,0 +1,32 @@
+{
+  "name": "SoraLink 空連 — Cabin Communication System",
+  "short_name": "SoraLink",
+  "description": "Offline-first in-flight passenger and crew communication platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FAF8F3",
+  "theme_color": "#FAF8F3",
+  "icons": [
+    {
+      "src": "/static/img/soralink-crane-emblem-48.png",
+      "sizes": "48x48",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/img/soralink-crane-emblem-128.png",
+      "sizes": "128x128",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/img/soralink-crane-emblem-256.png",
+      "sizes": "256x256",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/img/soralink-crane-emblem-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
